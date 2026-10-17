@@ -154,6 +154,8 @@ def index():
                 with battery_display:
                     battery_label = ui.label().classes("absolute-center text-sm text-white")
 
+        get_up_button = ui.button(text="GET UP", on_click=send_get_up, color="#FFAE00").style("width: 25%")
+
         with ui.element("div").classes("stage"):
             img = ui.interactive_image().classes("video w-full")
             left_stick = ui.joystick(
@@ -166,8 +168,6 @@ def index():
                 mode='static',
                 size=200,
             ).classes("stick-right").style('background-color: transparent; padding-right: 40%')
-
-    get_up_button = ui.button(text="GET UP", on_click=send_get_up)
 
     last = {"n": -1}
 
