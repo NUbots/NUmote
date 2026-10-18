@@ -1,6 +1,6 @@
 import asyncio, base64, struct
 from nicegui import app, ui
-from robot import Sender, extract_jpeg, map_stick, parse
+from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
 import json, socket
 
 ip_address = "10.1.168.33" # Gauss, on the lab network
@@ -10,6 +10,7 @@ state = {"jpeg": None, "battery": 0, "count": 0}
 
 sender = None
 max_mag = 1
+max_yaw = 1
 
 def start_sender(ip):
     global sender
@@ -172,7 +173,9 @@ def index():
     last = {"n": -1}
 
     left_stick.on_move(lambda e: sender.set(*map_stick(e.y, -e.x, max_mag)))
-    left_stick.on_end(lambda e: sender.release())
+    left_stick.on_end(lambda e: sender.release_move())
+    right_stick.on_move(lambda e: sender.set_yaw(map_yaw(-e.x, max_yaw)))
+    right_stick.on_end(lambda e: sender.release_yaw())
 
     ui.timer(1 / 30, refresh)
 
