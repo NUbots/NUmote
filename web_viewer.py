@@ -9,7 +9,7 @@ ip_list = [] # this is the list of discovered Robot IPs
 video_stream_port = 51111 # this seems to be standard for the Boosters.
 discovery_port = 9000 # found with WireShark
 
-state = {"jpeg": None, "battery": 0, "count": 0}
+state = {"jpeg": None, "battery": 0, "count": 0, "waving": False}
 
 sender = None
 discovery_sock = None
@@ -41,11 +41,12 @@ def extract_battery(msg: bytes):
         pass
     return None
 
-def send_get_up():
+def send_action(action: str, value: int = 0):
+    """Send an agent button press. Returns True if the robot answered."""
     msg = {
         "request": "send_to_agent",
         "params": {"agent_id": "com.boosterobotics.default"},
-        "agent_req": {"event": "on_component_click", "component_id": "get_up", "state": 0},
+        "agent_req": {"event": "on_component_click", "component_id": action, "state": value},
         "language": "en",
         "app_api_level": 10800,
         "app_platform": "Android",
@@ -54,12 +55,19 @@ def send_get_up():
 
     if not robot_ip:
         ui.notify("No robot selected")
-        return
+        return False
 
     with socket.create_connection((robot_ip, 6868), timeout=5) as s:
         s.sendall(struct.pack("<I", len(body)) + body)
         n = struct.unpack("<I", s.recv(4))[0]
         print(s.recv(n).decode())
+    return True
+
+def toggle_wave():
+    # "state" is the toggle's current position, like the official app's switch:
+    # 0 (currently off) starts the wave, 1 (currently on) stops it
+    if send_action("wave", 1 if state["waving"] else 0):
+        state["waving"] = not state["waving"]  # only flip once the robot has the command
 
 def start_discovery():
     global discovery_sock
@@ -107,7 +115,7 @@ def connect(ip):
     global ws_task
     if ws_task:
         ws_task.cancel()
-    state.update(jpeg=None, battery=0, count=0)
+    state.update(jpeg=None, battery=0, count=0, waving=False)
     ws_task = asyncio.create_task(ws_loop(f"ws://{ip}:{video_stream_port}/"))
 
 # only auto-connect if an IP is hardcoded above; otherwise wait for one to be picked from the menu
@@ -132,6 +140,10 @@ def index():
         if len(ip_list) != last["ips"]:  # ip_list only ever grows
             last["ips"] = len(ip_list)
             ip_menu.refresh()
+
+        if state["waving"] != last.get("waving"):  # global, so every open page shows the same
+            last["waving"] = state["waving"]
+            wave_button.text = "STOP WAVE" if state["waving"] else "WAVE"
 
         if state["count"] != last["n"]:
             last["n"] = state["count"]
@@ -190,9 +202,6 @@ def index():
         # phone: logo + battery on one line, IP underneath. desktop: all on one line.
         with ui.row().classes("w-full items-center gap-x-4 gap-y-1"):
             ui.image(source="numote.png").props("fit=contain").classes("shrink-0 w-16 h-10 sm:w-24 sm:h-14")  # 517x302 logo
-            
-            '''ip_input = ui.input(label="Robot IP", value=robot_ip).props("dense") \
-                .classes("order-last w-full sm:order-none sm:w-48").on("keydown.enter", reconnect)'''
 
             ip_menu()
             
@@ -201,10 +210,13 @@ def index():
                 battery_display = ui.linear_progress(show_value=False, size="20px", color=None).classes("grow rounded")
                 with battery_display:
                     battery_label = ui.label().classes("absolute-center text-sm text-white")
-                get_up_button = ui.button(text="GET UP", on_click=send_get_up, color="#FFAE00").style("width: 25%")
+                get_up_button = ui.button(text="GET UP", on_click=lambda: send_action("get_up"), color="#FFAE00").style("width: 25%")
+                wave_button = ui.button(text="WAVE", on_click=toggle_wave, color="#FFAE00").style("width: 25%")
 
         with ui.element("div").classes("stage"):
             img = ui.interactive_image().classes("video w-full")
+            with img:
+                ui.button(icon="fullscreen", on_click=lambda: ui.run_javascript(f"getHtmlElement({img.id}).requestFullscreen()")).props("flat round dense color=white").classes("absolute top-2 right-2")
             left_stick = ui.joystick(
                 color='#FFAE00',
                 mode='static',
