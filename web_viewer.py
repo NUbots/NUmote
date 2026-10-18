@@ -1,6 +1,7 @@
 import asyncio, base64, struct
 from nicegui import app, ui
 from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
+import json, socket
 
 ip_address = "10.1.168.33" # Gauss, on the lab network
 port = 51111 # this seems to be standard for the Boosters.
@@ -35,6 +36,22 @@ def extract_battery(msg: bytes):
     except Exception:
         pass
     return None
+
+def send_get_up():
+    msg = {
+        "request": "send_to_agent",
+        "params": {"agent_id": "com.boosterobotics.default"},
+        "agent_req": {"event": "on_component_click", "component_id": "get_up", "state": 0},
+        "language": "en",
+        "app_api_level": 10800,
+        "app_platform": "Android",
+    }
+    body = json.dumps(msg, separators=(",", ":")).encode()
+
+    with socket.create_connection((ip_address, 6868), timeout=5) as s:
+        s.sendall(struct.pack("<I", len(body)) + body)
+        n = struct.unpack("<I", s.recv(4))[0]
+        print(s.recv(n).decode())
         
 
 async def ws_loop(url):
@@ -137,6 +154,8 @@ def index():
                 battery_display = ui.linear_progress(show_value=False, size="20px", color=None).classes("grow rounded")
                 with battery_display:
                     battery_label = ui.label().classes("absolute-center text-sm text-white")
+
+        get_up_button = ui.button(text="GET UP", on_click=send_get_up, color="#FFAE00").style("width: 25%")
 
         with ui.element("div").classes("stage"):
             img = ui.interactive_image().classes("video w-full")
