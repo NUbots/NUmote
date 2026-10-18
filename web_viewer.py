@@ -3,12 +3,16 @@ from nicegui import app, ui
 from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
 import json, socket
 
-ip_address = "10.1.168.33" # Gauss, on the lab network
-port = 51111 # this seems to be standard for the Boosters.
+robot_ip = "" # empty for now
+ip_list = [] # this is the list of discovered Robot IPs
+
+video_stream_port = 51111 # this seems to be standard for the Boosters.
+discovery_port = 9000 # found with WireShark
 
 state = {"jpeg": None, "battery": 0, "count": 0}
 
 sender = None
+discovery_sock = None
 max_mag = 1
 max_yaw = 1
 
@@ -48,11 +52,33 @@ def send_get_up():
     }
     body = json.dumps(msg, separators=(",", ":")).encode()
 
-    with socket.create_connection((ip_address, 6868), timeout=5) as s:
+    if not robot_ip:
+        ui.notify("No robot selected")
+        return
+
+    with socket.create_connection((robot_ip, 6868), timeout=5) as s:
         s.sendall(struct.pack("<I", len(body)) + body)
         n = struct.unpack("<I", s.recv(4))[0]
         print(s.recv(n).decode())
-        
+
+def start_discovery():
+    global discovery_sock
+    discovery_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    discovery_sock.bind(("", discovery_port))  # all interfaces, so broadcasts arrive
+    discovery_sock.setblocking(False)  # polled from the event loop, must never block
+
+def find_booster_ip(sock: socket.socket):
+    # performs a sort of crude discovery by filtering some data out of the UDP traffic
+    global ip_list
+    while True:  # drain everything that arrived since the last poll
+        try:
+            data, addr = sock.recvfrom(1024)
+
+            if "Booster" in str(data) and addr[0] not in ip_list:
+                ip_list.append(addr[0])
+        except BlockingIOError:
+            return
 
 async def ws_loop(url):
     import websockets
@@ -82,16 +108,31 @@ def connect(ip):
     if ws_task:
         ws_task.cancel()
     state.update(jpeg=None, battery=0, count=0)
-    ws_task = asyncio.create_task(ws_loop(f"ws://{ip}:{port}/"))
+    ws_task = asyncio.create_task(ws_loop(f"ws://{ip}:{video_stream_port}/"))
 
-app.on_startup(lambda: connect(ip_address))
-app.on_startup(lambda: start_sender(ip_address))
+# only auto-connect if an IP is hardcoded above; otherwise wait for one to be picked from the menu
+app.on_startup(lambda: robot_ip and connect(robot_ip))
+app.on_startup(lambda: robot_ip and start_sender(robot_ip))
+app.on_startup(start_discovery)
+app.on_shutdown(lambda: discovery_sock and discovery_sock.close())
+app.timer(1.0, lambda: discovery_sock and find_booster_ip(discovery_sock))
 app.on_disconnect(lambda: sender and sender.release())
 app.on_shutdown(lambda: sender and sender.shutdown())
 
 @ui.page("/")
 def index():
+    @ui.refreshable
+    def ip_menu():
+        # rebuilt by refresh() whenever discovery finds a new robot
+        with ui.dropdown_button('IP Address: ', color="#FFAE00"):
+            for address in ip_list:
+                ui.item(address, on_click=lambda a=address: reconnect(a))  # a=address binds this loop's value
+
     def refresh():
+        if len(ip_list) != last["ips"]:  # ip_list only ever grows
+            last["ips"] = len(ip_list)
+            ip_menu.refresh()
+
         if state["count"] != last["n"]:
             last["n"] = state["count"]
             if state["jpeg"]:
@@ -113,10 +154,12 @@ def index():
             else: # low battery
                 battery_display.style('color: #c91c1c')
 
-    async def reconnect():
+    async def reconnect(new_ip):
         # change the IP it wants to connect to (video + joystick)
-        new_ip = ip_input.value.strip()
+        global robot_ip
+        new_ip = new_ip.strip()
         if new_ip:
+            robot_ip = new_ip
             connect(new_ip)
             ui.notify(f"Connecting to {new_ip}")
             await asyncio.to_thread(start_sender, new_ip)  # shutdown of old sender blocks briefly
@@ -147,8 +190,12 @@ def index():
         # phone: logo + battery on one line, IP underneath. desktop: all on one line.
         with ui.row().classes("w-full items-center gap-x-4 gap-y-1"):
             ui.image(source="numote.png").props("fit=contain").classes("shrink-0 w-16 h-10 sm:w-24 sm:h-14")  # 517x302 logo
-            ip_input = ui.input(label="Robot IP", value=ip_address).props("dense") \
-                .classes("order-last w-full sm:order-none sm:w-48").on("keydown.enter", reconnect)
+            
+            '''ip_input = ui.input(label="Robot IP", value=robot_ip).props("dense") \
+                .classes("order-last w-full sm:order-none sm:w-48").on("keydown.enter", reconnect)'''
+
+            ip_menu()
+            
             with ui.row().classes("flex-1 min-w-0 items-center no-wrap gap-2"):
                 ui.label("Battery").classes("max-sm:hidden whitespace-nowrap")
                 battery_display = ui.linear_progress(show_value=False, size="20px", color=None).classes("grow rounded")
@@ -169,12 +216,13 @@ def index():
                 size=200,
             ).classes("stick-right").style('background-color: transparent; padding-right: 40%')
 
-    last = {"n": -1}
+    last = {"n": -1, "ips": len(ip_list)}
 
-    left_stick.on_move(lambda e: sender.set(*map_stick(e.y, -e.x, max_mag)))
-    left_stick.on_end(lambda e: sender.release_move())
-    right_stick.on_move(lambda e: sender.set_yaw(map_yaw(-e.x, max_yaw)))
-    right_stick.on_end(lambda e: sender.release_yaw())
+    # sender is None until a robot is picked
+    left_stick.on_move(lambda e: sender and sender.set(*map_stick(e.y, -e.x, max_mag)))
+    left_stick.on_end(lambda e: sender and sender.release_move())
+    right_stick.on_move(lambda e: sender and sender.set_yaw(map_yaw(-e.x, max_yaw)))
+    right_stick.on_end(lambda e: sender and sender.release_yaw())
 
     ui.timer(1 / 30, refresh)
 
