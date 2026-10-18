@@ -4,7 +4,7 @@ Robot protocol helpers: protobuf encode/decode, the joystick command, and a back
 Joystick command (id 1003), sent to /booster.proto.rpc.RobotGrpc/RobotRequest:
     1: 1003            command id
     2: "<uuid>"        fresh per message
-    3 { 1: x  2: y  3: z }   floats; x,y = the stick, z unused (-0.0 in the capture)
+    3 { 1: x  2: y  3: z }   floats; x,y = left stick (translation), z = right stick (yaw)
     5: 1
 
 Video frames arrive over websockets as:
@@ -122,6 +122,11 @@ def map_stick(sx, sy, max_mag):
     return clamp_disc(sx * max_mag, sy * max_mag, max_mag)
 
 
+def map_yaw(sx, max_yaw):
+    """Stick axis (-1..1) -> field 3.3, capped at max_yaw."""
+    return max(-max_yaw, min(max_yaw, sx * max_yaw))
+
+
 class Sender(threading.Thread):
     """Sends the current stick value at a fixed rate while active; sends stop when asked."""
 
@@ -131,8 +136,8 @@ class Sender(threading.Thread):
         self.dt = 1.0 / rate
         self.timeout = timeout
         self.lock = threading.Lock()
-        self.x = self.y = 0.0
-        self.active = False
+        self.x = self.y = self.z = 0.0
+        self.move_active = self.yaw_active = False
         self.stop_pending = False
         self.running = True
         self.channel = grpc.insecure_channel(target)
@@ -141,13 +146,33 @@ class Sender(threading.Thread):
 
     def set(self, x, y):
         with self.lock:
-            self.x, self.y, self.active = x, y, True
+            self.x, self.y, self.move_active = x, y, True
 
-    def release(self):
-        """Stick released / emergency: stop sending and send zeros."""
+    def set_yaw(self, z):
+        with self.lock:
+            self.z, self.yaw_active = z, True
+
+    def release_move(self):
+        """Left stick released: zero x,y; stop entirely if yaw is idle too."""
         with self.lock:
             self.x = self.y = 0.0
-            self.active = False
+            self.move_active = False
+            if not self.yaw_active:
+                self.stop_pending = True
+
+    def release_yaw(self):
+        """Right stick released: zero z; stop entirely if movement is idle too."""
+        with self.lock:
+            self.z = 0.0
+            self.yaw_active = False
+            if not self.move_active:
+                self.stop_pending = True
+
+    def release(self):
+        """Emergency / disconnect: stop sending and send zeros."""
+        with self.lock:
+            self.x = self.y = self.z = 0.0
+            self.move_active = self.yaw_active = False
             self.stop_pending = True
 
     def _send_stop(self):
@@ -162,13 +187,14 @@ class Sender(threading.Thread):
         nxt = time.monotonic()
         while self.running:
             with self.lock:
-                x, y, active, stop = self.x, self.y, self.active, self.stop_pending
+                x, y, z, stop = self.x, self.y, self.z, self.stop_pending
+                active = self.move_active or self.yaw_active
                 if stop:
                     self.stop_pending = False
             if stop:
                 self._send_stop()
             elif active:
-                self.call.future(joystick_message(x, y), timeout=self.timeout)
+                self.call.future(joystick_message(x, y, z), timeout=self.timeout)
             nxt += self.dt
             delay = nxt - time.monotonic()
             if delay > 0:
