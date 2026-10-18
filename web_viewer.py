@@ -154,8 +154,7 @@ def index():
                 battery_display = ui.linear_progress(show_value=False, size="20px", color=None).classes("grow rounded")
                 with battery_display:
                     battery_label = ui.label().classes("absolute-center text-sm text-white")
-
-        get_up_button = ui.button(text="GET UP", on_click=send_get_up, color="#FFAE00").style("width: 25%")
+                get_up_button = ui.button(text="GET UP", on_click=send_get_up, color="#FFAE00").style("width: 25%")
 
         with ui.element("div").classes("stage"):
             img = ui.interactive_image().classes("video w-full")
