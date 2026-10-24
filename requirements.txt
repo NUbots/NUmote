@@ -1,3 +1,4 @@
 nicegui
 websockets
 grpcio
+pygame-ce
