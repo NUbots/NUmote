@@ -212,3 +212,50 @@ class Sender(threading.Thread):
             time.sleep(0.02)
         time.sleep(0.15)
         self.running = False
+
+
+class Head(threading.Thread):
+    """Moves the head through the Booster SDK (DDS); holding the d-pad sweeps the target angle."""
+
+    SPEED = 1.0  # rad/s
+    YAW_LIMIT = 1.0  # rad; conservative, below the hardware range
+    PITCH_MIN, PITCH_MAX = -0.3, 0.6
+
+    def __init__(self, domain_id=0, interface=""):
+        super().__init__(daemon=True)
+        import booster_robotics_sdk_python as sdk
+        sdk.ChannelFactory.Instance().Init(domain_id, interface)
+        self.client = sdk.B1LocoClient()
+        self.client.Init()
+        self.lock = threading.Lock()
+        self.dir = (0, 0)
+        self.yaw = self.pitch = 0.0
+        self.running = True
+
+    def set_dir(self, x, y):
+        """d-pad direction, each -1/0/1; right and up are positive."""
+        with self.lock:
+            self.dir = (x, y)
+
+    def run(self):
+        last = time.monotonic()
+        while self.running:
+            time.sleep(0.05)
+            now = time.monotonic()
+            dt, last = now - last, now
+            with self.lock:
+                dx, dy = self.dir
+            if not (dx or dy):
+                continue
+            # SDK: positive yaw looks left, positive pitch looks down
+            self.yaw = max(-self.YAW_LIMIT, min(self.YAW_LIMIT, self.yaw - dx * self.SPEED * dt))
+            self.pitch = max(self.PITCH_MIN, min(self.PITCH_MAX, self.pitch - dy * self.SPEED * dt))
+            try:
+                self.client.RotateHead(self.pitch, self.yaw)
+            except Exception as e:
+                print(f"head error: {e}")
+                time.sleep(2)  # the failed call already blocked for its timeout
+                last = time.monotonic()
+
+    def shutdown(self):
+        self.running = False
