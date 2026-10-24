@@ -124,6 +124,22 @@ def send_action(action: str, value: int = 0):
         print(s.recv(n).decode())
     return True
 
+def send_robot_mode(mode: int):
+    """Send an agent button press. Returns True if the robot answered."""
+    msg = {"request": "set_robot_mode", "params": {"mode_value": mode},
+       "language": "en", "app_api_level": 10800, "app_platform": "Android"}
+    body = json.dumps(msg, separators=(",", ":")).encode()
+
+    if not robot_ip:
+        ui.notify("No robot selected")
+        return False
+
+    with socket.create_connection((robot_ip, 6868), timeout=5) as s:
+        s.sendall(struct.pack("<I", len(body)) + body)
+        n = struct.unpack("<I", s.recv(4))[0]
+        print(s.recv(n).decode())
+    return True
+
 def toggle_wave():
     # "state" is the toggle's current position, like the official app's switch:
     # 0 (currently off) starts the wave, 1 (currently on) stops it
@@ -195,7 +211,7 @@ def index():
     @ui.refreshable
     def ip_menu():
         # rebuilt by refresh() whenever discovery finds a new robot
-        with ui.dropdown_button('IP Address: ', color="#FFAE00"):
+        with ui.dropdown_button('IP Address: ', color="#FFAE00").props("dense").classes("px-2 text-xs sm:px-3 sm:text-sm"):
             for address in ip_list:
                 ui.item(address, on_click=lambda a=address: reconnect(a))  # a=address binds this loop's value
 
@@ -251,30 +267,50 @@ def index():
         }
         .stage .video { grid-area: video; }
         .stage .video, .stage .video :is(img, svg) { max-height: 65dvh; object-fit: contain; }
-        .stage .stick-left { grid-area: left; justify-self: start; }
-        .stage .stick-right { grid-area: right; justify-self: end; }
+        .stage .stick-left { grid-area: left; justify-self: start; padding-left: 40%; }
+        .stage .stick-right { grid-area: right; justify-self: end; padding-right: 40%; }
+        .stage .stick-left, .stage .stick-right { background-color: transparent; }
 
         /* phone landscape: gamepad layout, sticks either side of the video */
         @media (orientation: landscape) and (max-height: 500px) {
             .stage { grid-template-areas: "left video right"; grid-template-columns: auto 1fr auto; }
             .stage .video, .stage .video :is(img, svg) { max-height: calc(100dvh - 7rem); }
         }
+
+        /* desktop: video at 80% of the window, sticks overlaid on its bottom corners */
+        @media (min-width: 1024px) and (min-height: 501px) {
+            .stage { width: 80vw; grid-template-areas: "video"; grid-template-columns: 1fr; }
+            .stage .video, .stage .video :is(img, svg) { max-height: calc(100dvh - 7rem); }
+            .stage .stick-left, .stage .stick-right {
+                grid-area: video; align-self: end; z-index: 1;
+                width: 200px; height: 200px; padding: 0; margin: 1.5rem;
+            }
+            .header { width: 80vw; }
+        }
     """)
 
-    with ui.column().classes("w-full max-w-5xl mx-auto gap-2 sm:gap-4"):
-        # phone: logo + battery on one line, IP underneath. desktop: all on one line.
-        with ui.row().classes("w-full items-center gap-x-4 gap-y-1"):
-            ui.image(source="numote.png").props("fit=contain").classes("shrink-0 w-16 h-10 sm:w-24 sm:h-14")  # 517x302 logo
+    with ui.column().classes("w-full max-w-5xl lg:max-w-none items-center mx-auto gap-2 sm:gap-4"):
+        # phone: compact logo + IP + battery on one line, action buttons underneath. desktop: all on one line.
+        with ui.row().classes("header w-full items-center gap-x-2 gap-y-1 sm:gap-x-4"):
+            ui.image(source="numote.png").props("fit=contain").classes("shrink-0 w-12 h-7 sm:w-24 sm:h-14")  # 517x302 logo
 
             ip_menu()
             
-            with ui.row().classes("flex-1 min-w-0 items-center no-wrap gap-2"):
+            # phone: small fixed-width bar. desktop: stretches to fill the line.
+            with ui.row().classes("w-20 items-center no-wrap gap-2 sm:flex-1 sm:w-auto sm:min-w-24"):
                 ui.label("Battery").classes("max-sm:hidden whitespace-nowrap")
                 battery_display = ui.linear_progress(show_value=False, size="20px", color=None).classes("grow rounded")
                 with battery_display:
-                    battery_label = ui.label().classes("absolute-center text-sm text-white")
-                get_up_button = ui.button(text="GET UP", on_click=lambda: send_action("get_up"), color="#FFAE00").style("width: 25%")
-                wave_button = ui.button(text="WAVE", on_click=toggle_wave, color="#FFAE00").style("width: 25%")
+                    battery_label = ui.label().classes("absolute-center text-xs sm:text-sm text-white")
+
+            # phone: full-width 4-column row under the header. desktop: inline at the end.
+            with ui.element("div").classes("grid grid-cols-4 gap-2 w-full sm:flex sm:w-auto"):
+                action = dict(color="#FFAE00")
+                action_classes = "min-w-0 px-1 text-xs sm:px-3 sm:text-sm"
+                get_up_button = ui.button(text="GET UP", on_click=lambda: send_action("get_up"), **action).props("dense").classes(action_classes)
+                wave_button = ui.button(text="WAVE", on_click=toggle_wave, **action).props("dense").classes(action_classes)
+                stand_button = ui.button(text="STAND", on_click=lambda: send_robot_mode(1), **action).props("dense").classes(action_classes)
+                walk_button = ui.button(text="WALK", on_click=lambda: send_robot_mode(2), **action).props("dense").classes(action_classes)
 
         with ui.element("div").classes("stage"):
             img = ui.interactive_image().classes("video w-full")
@@ -284,12 +320,12 @@ def index():
                 color='#FFAE00',
                 mode='static',
                 size=200,
-            ).classes("stick-left").style('background-color: transparent; padding-left: 40%')
+            ).classes("stick-left")
             right_stick = ui.joystick(
                 color='#FFAE00',
                 mode='static',
                 size=200,
-            ).classes("stick-right").style('background-color: transparent; padding-right: 40%')
+            ).classes("stick-right")
 
     last = {"n": -1, "ips": len(ip_list)}
 
