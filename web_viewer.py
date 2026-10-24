@@ -4,7 +4,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")  # no SDL window, so no focus
 import pygame
 from nicegui import app, ui
-from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
+from robot import Head, Sender, extract_jpeg, map_stick, map_yaw, parse
 import json, socket
 
 robot_ip = "" # empty for now
@@ -23,10 +23,26 @@ max_yaw = 1
 pad = None
 pad_axes = (0.0, 0.0, 0.0, 0.0)  # lx, ly, rx, ry after dead zone
 deadzone = 0.15
-# SDL joystick button index -> action; X is 3 and Y is 4 on this pad
-button_actions = {4: ("Y", lambda: send_action("get_up")), 3: ("X", lambda: toggle_wave())}
+# SDL joystick button index -> (name, action) on this pad
+button_actions = {
+    4: ("Y", lambda: send_action("get_up")),
+    3: ("X", lambda: toggle_wave()),
+    10: ("Back", lambda: send_robot_mode(1)),   # STAND
+    11: ("Start", lambda: send_robot_mode(2)),  # WALK
+}
+mode_buttons = {10, 11}
 buttons_down = set()
 head_dir = (0, 0)  # d-pad hat (x, y), each -1/0/1
+head = None
+
+def start_head():
+    global head
+    try:
+        # DDS must bind the interface that can reach the robot, e.g. NUMOTE_DDS_IFACE=wlo1
+        head = Head(int(os.environ.get("NUMOTE_DDS_DOMAIN", "0")), os.environ.get("NUMOTE_DDS_IFACE", ""))
+        head.start()
+    except Exception as e:  # SDK missing or DDS failed; everything else still works
+        print(f"head control unavailable: {e}")
 
 def start_pad():
     pygame.display.init()
@@ -34,19 +50,24 @@ def start_pad():
 
 def poll_pad():
     """Read the Xbox controller through SDL (Firefox mis-reports it over Bluetooth) and drive the robot."""
-    global pad, pad_axes
+    global pad, pad_axes, buttons_down
     pygame.event.pump()
     if pygame.joystick.get_count() == 0:
         pad = None
     elif pad is None:
         pad = pygame.joystick.Joystick(0)
 
-    for i, (name, action) in button_actions.items():
-        down = bool(pad and pad.get_numbuttons() > i and pad.get_button(i))
-        if down and i not in buttons_down and robot_ip:
-            print(f"{name} pressed")
-            asyncio.create_task(asyncio.to_thread(action))  # socket call blocks
-        buttons_down.discard(i) if not down else buttons_down.add(i)
+    now_down = {i for i in range(pad.get_numbuttons()) if pad.get_button(i)} if pad else set()
+    for i in now_down - buttons_down:
+        name, action = button_actions.get(i, (None, None))
+        print(f"button {i} pressed" + (f" ({name})" if name else ""))
+        if not action or not robot_ip:
+            continue
+        if i in mode_buttons and any(pad_axes):
+            print("ignored: sticks are deflected")  # don't change mode mid-walk
+            continue
+        asyncio.create_task(asyncio.to_thread(action))  # socket call blocks
+    buttons_down = now_down
 
     # d-pad is the head only; it must never touch the walking sticks below
     global head_dir
@@ -54,6 +75,8 @@ def poll_pad():
     if hat != head_dir:
         head_dir = hat
         print(f"d-pad (head): yaw={hat[0]} pitch={hat[1]}")
+        if head:
+            head.set_dir(*hat)
 
     if pad and pad.get_numaxes() >= 4:
         axes = tuple(v if abs(v) >= deadzone else 0.0 for v in (pad.get_axis(i) for i in range(4)))
@@ -200,6 +223,8 @@ app.on_startup(lambda: robot_ip and connect(robot_ip))
 app.on_startup(lambda: robot_ip and start_sender(robot_ip))
 app.on_startup(start_discovery)
 app.on_startup(start_pad)
+app.on_startup(start_head)
+app.on_shutdown(lambda: head and head.shutdown())
 app.timer(1 / 30, poll_pad)
 app.on_shutdown(lambda: discovery_sock and discovery_sock.close())
 app.timer(1.0, lambda: discovery_sock and find_booster_ip(discovery_sock))
