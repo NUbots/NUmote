@@ -1,4 +1,8 @@
-import asyncio, base64, struct
+import asyncio, base64, os, struct
+
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")  # no SDL window, so no focus
+import pygame
 from nicegui import app, ui
 from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
 import json, socket
@@ -15,6 +19,63 @@ sender = None
 discovery_sock = None
 max_mag = 1
 max_yaw = 1
+
+pad = None
+pad_axes = (0.0, 0.0, 0.0, 0.0)  # lx, ly, rx, ry after dead zone
+deadzone = 0.15
+# SDL joystick button index -> action; X is 3 and Y is 4 on this pad
+button_actions = {4: ("Y", lambda: send_action("get_up")), 3: ("X", lambda: toggle_wave())}
+buttons_down = set()
+head_dir = (0, 0)  # d-pad hat (x, y), each -1/0/1
+
+def start_pad():
+    pygame.display.init()
+    pygame.joystick.init()
+
+def poll_pad():
+    """Read the Xbox controller through SDL (Firefox mis-reports it over Bluetooth) and drive the robot."""
+    global pad, pad_axes
+    pygame.event.pump()
+    if pygame.joystick.get_count() == 0:
+        pad = None
+    elif pad is None:
+        pad = pygame.joystick.Joystick(0)
+
+    for i, (name, action) in button_actions.items():
+        down = bool(pad and pad.get_numbuttons() > i and pad.get_button(i))
+        if down and i not in buttons_down and robot_ip:
+            print(f"{name} pressed")
+            asyncio.create_task(asyncio.to_thread(action))  # socket call blocks
+        buttons_down.discard(i) if not down else buttons_down.add(i)
+
+    # d-pad is the head only; it must never touch the walking sticks below
+    global head_dir
+    hat = pad.get_hat(0) if pad and pad.get_numhats() > 0 else (0, 0)
+    if hat != head_dir:
+        head_dir = hat
+        print(f"d-pad (head): yaw={hat[0]} pitch={hat[1]}")
+
+    if pad and pad.get_numaxes() >= 4:
+        axes = tuple(v if abs(v) >= deadzone else 0.0 for v in (pad.get_axis(i) for i in range(4)))
+    else:
+        axes = (0.0, 0.0, 0.0, 0.0)
+
+    prev, pad_axes = pad_axes, axes
+    if not any(axes) and not any(prev):
+        return
+
+    lx, ly, rx, ry = axes
+    print(f"right=({rx:.2f}, {ry:.2f}) left=({lx:.2f}, {ly:.2f})")
+    if not sender:
+        return
+    if lx or ly:
+        sender.set(*map_stick(-ly, -lx, max_mag))
+    else:
+        sender.release_move()
+    if rx:
+        sender.set_yaw(map_yaw(-rx, max_yaw))
+    else:
+        sender.release_yaw()
 
 def start_sender(ip):
     global sender
@@ -122,6 +183,8 @@ def connect(ip):
 app.on_startup(lambda: robot_ip and connect(robot_ip))
 app.on_startup(lambda: robot_ip and start_sender(robot_ip))
 app.on_startup(start_discovery)
+app.on_startup(start_pad)
+app.timer(1 / 30, poll_pad)
 app.on_shutdown(lambda: discovery_sock and discovery_sock.close())
 app.timer(1.0, lambda: discovery_sock and find_booster_ip(discovery_sock))
 app.on_disconnect(lambda: sender and sender.release())
@@ -235,6 +298,26 @@ def index():
     left_stick.on_end(lambda e: sender and sender.release_move())
     right_stick.on_move(lambda e: sender and sender.set_yaw(map_yaw(-e.x, max_yaw)))
     right_stick.on_end(lambda e: sender and sender.release_yaw())
+
+    ui.run_javascript("""
+        // nipplejs knob; max travel is half the stick size (200 / 2)
+        window.moveKnob = (i, x, y) => {
+            const knob = document.querySelectorAll(".nipple .front")[i];
+            if (!knob) return;
+            const m = Math.hypot(x, y);
+            const k = m > 1 ? 1 / m : 1;
+            knob.style.transform = `translate(${x * k * 100}px, ${y * k * 100}px)`;
+        };
+    """)
+
+    def show_pad():
+        # mirror the physical controller onto the on-screen knobs
+        if pad_axes != last.get("pad"):
+            last["pad"] = pad_axes
+            lx, ly, rx, ry = pad_axes
+            ui.run_javascript(f"moveKnob(0,{lx},{ly});moveKnob(1,{rx},{ry})")
+
+    ui.timer(1 / 30, show_pad)
 
     ui.timer(1 / 30, refresh)
 
