@@ -26,10 +26,6 @@ recording_lock = threading.Lock()
 video_recorder = None
 
 sender = None
-mode_client = None
-mode_sdk = None
-mode_client_error = None
-mode_client_lock = threading.Lock()
 discovery_sock = None
 max_mag = 1
 max_yaw = 1
@@ -64,32 +60,9 @@ record_combo_stage = 0
 left_trigger_was_pressed = False
 right_trigger_was_pressed = False
 
-def default_route_iface():
-    try:
-        with open("/proc/net/route") as routes:
-            for line in list(routes)[1:]:
-                name, destination, *_ = line.split()
-                if destination == "00000000":
-                    return name
-    except OSError:
-        pass
-    return ""
-
-def start_mode_client():
-    global mode_client, mode_sdk, mode_client_error
-    import booster_robotics_sdk_python as sdk
-
-    interface = os.environ.get("NUMOTE_DDS_IFACE") or default_route_iface()
-    domain_id = int(os.environ.get("NUMOTE_DDS_DOMAIN", "0"))
-    print(f"robot mode control: DDS interface {interface or '(default)'}")
-    sdk.ChannelFactory.Instance().Init(domain_id, interface)
-    client = sdk.B1LocoClient()
-    client.Init()
-    mode_client = client
-    mode_sdk = sdk
-    mode_client_error = None
-
 class VideoRecorder:
+    FPS = 30
+
     def __init__(self):
         ffmpeg = shutil.which(os.environ.get("NUMOTE_FFMPEG", "ffmpeg"))
         if not ffmpeg:
@@ -99,13 +72,17 @@ class VideoRecorder:
         output_dir.mkdir(parents=True, exist_ok=True)
         self.path = output_dir / f"numote_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.mp4"
         self.frames = queue.Queue(maxsize=120)
+        self.frame_interval = 1.0 / self.FPS
+        self.schedule_lock = threading.Lock()
+        self.last_frame = None
+        self.next_frame_at = None
         self.stopping = threading.Event()
         self.dropped_frames = 0
         self.error = None
         self.process = subprocess.Popen(
             [
                 ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "image2pipe", "-framerate", "30", "-vcodec", "mjpeg", "-i", "pipe:0",
+                "-f", "image2pipe", "-framerate", str(self.FPS), "-vcodec", "mjpeg", "-i", "pipe:0",
                 "-an", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(self.path),
@@ -118,13 +95,28 @@ class VideoRecorder:
         self.worker = threading.Thread(target=self._write_frames, daemon=True)
         self.worker.start()
 
-    def add_frame(self, frame):
-        if self.stopping.is_set() or self.process.poll() is not None:
-            return
+    def _enqueue_frame(self, frame):
         try:
             self.frames.put_nowait(frame)
         except queue.Full:
             self.dropped_frames += 1
+
+    def add_frame(self, frame, captured_at=None):
+        if self.process.poll() is not None:
+            return
+        now = time.monotonic() if captured_at is None else captured_at
+        with self.schedule_lock:
+            if self.stopping.is_set():
+                return
+            if self.last_frame is None:
+                self._enqueue_frame(frame)
+                self.last_frame = frame
+                self.next_frame_at = now + self.frame_interval
+                return
+            while now - self.next_frame_at > self.frame_interval * 1e-6:
+                self._enqueue_frame(self.last_frame)
+                self.next_frame_at += self.frame_interval
+            self.last_frame = frame
 
     def _write_frames(self):
         try:
@@ -154,7 +146,11 @@ class VideoRecorder:
                 self.error = f"FFmpeg exited with code {return_code}"
 
     def stop(self):
-        self.stopping.set()
+        with self.schedule_lock:
+            self.stopping.set()
+            if self.last_frame is not None:
+                self._enqueue_frame(self.last_frame)
+                self.last_frame = None
         self.worker.join(timeout=12)
         if self.worker.is_alive():
             self.process.terminate()
@@ -356,19 +352,13 @@ def poll_pad():
         sender.release_yaw()
 
 def start_sender(ip):
-    global sender, mode_client_error
+    global sender
     if sender:
         sender.shutdown()
 
     sender = Sender(f"{ip}:50051", 50, 1.0)
     sender.start()
     start_head(ip)
-    if mode_client is None or mode_sdk is None:
-        try:
-            start_mode_client()
-        except Exception as e:
-            mode_client_error = str(e)
-            print(f"robot mode control unavailable: {e}")
 
 def extract_battery(msg: bytes):
     """Return battery value from a status (id 10000) message, or None."""
@@ -443,23 +433,15 @@ def send_action(action: str, value: int = 0):
     return _send_robot_request(msg, f"action {action}")
 
 def send_robot_mode(mode: int):
-    """Set WALK or PREPARE mode using the Booster SDK."""
-    if mode_client is None:
-        print(f"robot mode change failed: {mode_client_error or 'SDK client is not initialized'}")
-        return False
-    sdk_mode = {1: mode_sdk.RobotMode.kPrepare, 2: mode_sdk.RobotMode.kWalking}.get(mode)
-    if sdk_mode is None:
-        print(f"robot mode change failed: unsupported mode {mode}")
-        return False
-    try:
-        with mode_client_lock:
-            mode_client.ChangeMode(sdk_mode)
-            current_mode = mode_client.GetMode()
-        print(f"robot mode requested: {sdk_mode}; current mode: {current_mode}")
-        return True
-    except Exception as e:
-        print(f"robot mode change failed: {e}")
-        return False
+    """Switch between STAND and WALK through the robot's app control endpoint."""
+    msg = {
+        "request": "set_robot_mode",
+        "params": {"mode_value": mode},
+        "language": "en",
+        "app_api_level": 10800,
+        "app_platform": "Android",
+    }
+    return _send_robot_request(msg, f"robot mode {mode}")
 
 def toggle_wave():
     # "state" is the toggle's current position, like the official app's switch:
