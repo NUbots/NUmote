@@ -139,6 +139,7 @@ class Sender(threading.Thread):
         self.x = self.y = self.z = 0.0
         self.move_active = self.yaw_active = False
         self.stop_pending = False
+        self.call_in_flight = False
         self.running = True
         self.channel = grpc.insecure_channel(target)
         self.call = self.channel.unary_unary(
@@ -183,6 +184,15 @@ class Sender(threading.Thread):
                 pass
             time.sleep(0.02)
 
+    def _active_call_done(self, future):
+        try:
+            future.result()
+        except Exception as e:
+            print(f"joystick error: {e}")
+        finally:
+            with self.lock:
+                self.call_in_flight = False
+
     def run(self):
         nxt = time.monotonic()
         while self.running:
@@ -191,10 +201,19 @@ class Sender(threading.Thread):
                 active = self.move_active or self.yaw_active
                 if stop:
                     self.stop_pending = False
+                send_active = active and not self.call_in_flight
+                if send_active:
+                    self.call_in_flight = True
             if stop:
                 self._send_stop()
-            elif active:
-                self.call.future(joystick_message(x, y, z), timeout=self.timeout)
+            elif send_active:
+                try:
+                    future = self.call.future(joystick_message(x, y, z), timeout=self.timeout)
+                    future.add_done_callback(self._active_call_done)
+                except Exception as e:
+                    with self.lock:
+                        self.call_in_flight = False
+                    print(f"joystick error: {e}")
             nxt += self.dt
             delay = nxt - time.monotonic()
             if delay > 0:
