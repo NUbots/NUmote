@@ -148,10 +148,50 @@ class Sender(threading.Thread):
         self.max_rpc_ms = 0.0
         self.last_rpc_error = ""
         self.next_diagnostic_at = time.monotonic() + 1.0
+        self.grpc = grpc
+        self.target = target
+        self.consecutive_transport_failures = 0
+        self.reconnect_requested = False
+        self.reconnect_forced = False
+        self.next_reconnect_at = 0.0
+        self.rpc_generation = 0
+        self.oldest_in_flight_at = None
+        self.rpc_stall_timeout = max(3.0, timeout * 3)
         self.running = True
-        self.channel = grpc.insecure_channel(target)
-        self.call = self.channel.unary_unary(
+        self.channel, self.call = self._create_channel()
+
+    def _create_channel(self):
+        channel = self.grpc.insecure_channel(self.target)
+        call = channel.unary_unary(
             METHOD, request_serializer=lambda b: b, response_deserializer=lambda b: b)
+        return channel, call
+
+    @staticmethod
+    def _is_transient_rpc_error(error):
+        code = getattr(error, "code", None)
+        if not callable(code):
+            return False
+        try:
+            code = code()
+        except Exception:
+            return False
+        code_name = getattr(code, "name", str(code).rsplit(".", 1)[-1])
+        return code_name in {"UNAVAILABLE", "DEADLINE_EXCEEDED"}
+
+    def _reconnect_channel(self):
+        new_channel, new_call = self._create_channel()
+        with self.lock:
+            old_channel = self.channel
+            self.channel, self.call = new_channel, new_call
+            self.rpc_generation += 1
+            self.in_flight = 0
+            self.oldest_in_flight_at = None
+            self.consecutive_transport_failures = 0
+            self.reconnect_requested = False
+            self.reconnect_forced = False
+            self.next_reconnect_at = 0.0
+        old_channel.close()
+        print("joystick rpc: recreated channel after repeated transport failures")
 
     def set(self, x, y):
         with self.lock:
@@ -192,53 +232,104 @@ class Sender(threading.Thread):
                 pass
             time.sleep(0.02)
 
-    def _active_call_done(self, future, started_at):
-        error = ""
+    def _active_call_done(self, future, started_at, generation):
+        error = None
         try:
             future.result()
         except Exception as e:
-            error = str(e)
+            error = e
         elapsed_ms = (time.monotonic() - started_at) * 1000
         with self.lock:
+            if generation != self.rpc_generation:
+                return
             self.in_flight -= 1
+            if self.in_flight == 0:
+                self.oldest_in_flight_at = None
             self.completed_calls += 1
             self.last_rpc_ms = elapsed_ms
             self.max_rpc_ms = max(self.max_rpc_ms, elapsed_ms)
             if error:
                 self.failed_calls += 1
-                self.last_rpc_error = error
+                self.last_rpc_error = str(error)
+                if self._is_transient_rpc_error(error):
+                    self.consecutive_transport_failures += 1
+                    if self.consecutive_transport_failures >= 3:
+                        self.reconnect_requested = True
+                        self.next_reconnect_at = time.monotonic() + 0.25
+            else:
+                self.consecutive_transport_failures = 0
+                self.last_rpc_error = ""
 
-    def _active_call_submit_failed(self, started_at, error):
+    def _active_call_submit_failed(self, started_at, error, generation):
         elapsed_ms = (time.monotonic() - started_at) * 1000
         with self.lock:
+            if generation != self.rpc_generation:
+                return
             self.in_flight -= 1
+            if self.in_flight == 0:
+                self.oldest_in_flight_at = None
             self.failed_calls += 1
             self.last_rpc_ms = elapsed_ms
             self.max_rpc_ms = max(self.max_rpc_ms, elapsed_ms)
             self.last_rpc_error = str(error)
+            if self._is_transient_rpc_error(error):
+                self.consecutive_transport_failures += 1
+                if self.consecutive_transport_failures >= 3:
+                    self.reconnect_requested = True
+                    self.next_reconnect_at = time.monotonic() + 0.25
 
     def run(self):
         nxt = time.monotonic()
         while self.running:
+            now = time.monotonic()
             with self.lock:
                 x, y, z, stop = self.x, self.y, self.z, self.stop_pending
                 active = self.move_active or self.yaw_active
                 if stop:
                     self.stop_pending = False
-                send_active = active and self.in_flight < self.max_in_flight
+                if (
+                    active
+                    and self.in_flight
+                    and self.oldest_in_flight_at is not None
+                    and now - self.oldest_in_flight_at >= self.rpc_stall_timeout
+                ):
+                    self.reconnect_requested = True
+                    self.reconnect_forced = True
+                    self.next_reconnect_at = now
+                    self.last_rpc_error = f"RPCs stalled for {now - self.oldest_in_flight_at:.1f} s"
+                reconnect = (
+                    self.reconnect_requested
+                    and (self.in_flight == 0 or self.reconnect_forced)
+                    and now >= self.next_reconnect_at
+                )
+                send_active = active and not self.reconnect_requested and self.in_flight < self.max_in_flight
                 if active and not send_active:
                     self.skipped_updates += 1
                 if send_active:
                     self.in_flight += 1
+                    generation = self.rpc_generation
+                    if self.oldest_in_flight_at is None:
+                        self.oldest_in_flight_at = now
+            if reconnect:
+                try:
+                    self._reconnect_channel()
+                except Exception as e:
+                    with self.lock:
+                        self.next_reconnect_at = time.monotonic() + 1.0
+                        self.last_rpc_error = f"channel reconnect failed: {e}"
+                    print(f"joystick rpc: channel reconnect failed: {e}")
             if stop:
                 self._send_stop()
             elif send_active:
                 started_at = time.monotonic()
                 try:
                     future = self.call.future(joystick_message(x, y, z), timeout=self.timeout)
-                    future.add_done_callback(lambda result, started=started_at: self._active_call_done(result, started))
+                    future.add_done_callback(
+                        lambda result, started=started_at, token=generation:
+                            self._active_call_done(result, started, token)
+                    )
                 except Exception as e:
-                    self._active_call_submit_failed(started_at, e)
+                    self._active_call_submit_failed(started_at, e, generation)
 
             now = time.monotonic()
             if now >= self.next_diagnostic_at:
@@ -278,6 +369,8 @@ class Sender(threading.Thread):
             time.sleep(0.02)
         time.sleep(0.15)
         self.running = False
+        self.channel.close()
+        self.join(timeout=1.0)
 
 
 class Head(threading.Thread):

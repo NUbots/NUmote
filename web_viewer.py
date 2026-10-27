@@ -52,6 +52,11 @@ controller_button_actions = {
     pygame.CONTROLLER_BUTTON_BACK: ("Back", lambda: send_robot_mode(1)),
     pygame.CONTROLLER_BUTTON_START: ("Start", lambda: send_robot_mode(2)),
 }
+switch_controller_button_actions = {
+    **controller_button_actions,
+    pygame.CONTROLLER_BUTTON_Y: ("X", lambda: toggle_wave()),
+    pygame.CONTROLLER_BUTTON_X: ("Y", lambda: send_action("get_up")),
+}
 raw_mode_buttons = {10, 11}
 controller_mode_buttons = {pygame.CONTROLLER_BUTTON_BACK, pygame.CONTROLLER_BUTTON_START}
 buttons_down = set()
@@ -257,11 +262,19 @@ def poll_pad():
     elif pad is None:
         pad = pygame.joystick.Joystick(0)
         controller = sdl_controller.Controller(0) if sdl_controller.is_controller(0) else None
-        mapping_status = "SDL mapping" if controller else "raw button mapping"
+        is_switch_layout = "nintendo switch" in pad.get_name().lower()
+        mapping_status = (
+            "SDL Switch face labels" if controller and is_switch_layout else
+            "SDL mapping" if controller else
+            "raw button mapping"
+        )
         controller_status = f"{pad.get_name()} ({mapping_status})"
         print(f"controller connected: {controller_status}")
 
-    actions = controller_button_actions if controller else button_actions
+    if controller and "nintendo switch" in pad.get_name().lower():
+        actions = switch_controller_button_actions
+    else:
+        actions = controller_button_actions if controller else button_actions
     if controller:
         now_down = {button for button in actions if controller.get_button(button)}
     elif pad:
