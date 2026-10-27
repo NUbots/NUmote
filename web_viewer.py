@@ -3,8 +3,10 @@ import asyncio, base64, os, struct
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")  # no SDL window, so no focus
 import pygame
+import pygame._sdl2.controller as sdl_controller
 from nicegui import app, ui
-from robot import Head, Sender, extract_jpeg, map_stick, map_yaw, parse
+from gprc_head import GrpcHead
+from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
 import json, socket
 
 robot_ip = "" # empty for now
@@ -21,6 +23,8 @@ max_mag = 1
 max_yaw = 1
 
 pad = None
+controller = None
+controller_status = "No controller connected"
 pad_axes = (0.0, 0.0, 0.0, 0.0)  # lx, ly, rx, ry after dead zone
 deadzone = 0.15
 # SDL joystick button index -> (name, action) on this pad
@@ -30,39 +34,63 @@ button_actions = {
     10: ("Back", lambda: send_robot_mode(1)),   # STAND
     11: ("Start", lambda: send_robot_mode(2)),  # WALK
 }
-mode_buttons = {10, 11}
+controller_button_actions = {
+    pygame.CONTROLLER_BUTTON_Y: ("Y", lambda: send_action("get_up")),
+    pygame.CONTROLLER_BUTTON_X: ("X", lambda: toggle_wave()),
+    pygame.CONTROLLER_BUTTON_BACK: ("Back", lambda: send_robot_mode(1)),
+    pygame.CONTROLLER_BUTTON_START: ("Start", lambda: send_robot_mode(2)),
+}
+raw_mode_buttons = {10, 11}
+controller_mode_buttons = {pygame.CONTROLLER_BUTTON_BACK, pygame.CONTROLLER_BUTTON_START}
 buttons_down = set()
 head_dir = (0, 0)  # d-pad hat (x, y), each -1/0/1
 head = None
 
-def start_head():
+def start_head(ip):
     global head
-    try:
-        # DDS must bind the interface that can reach the robot, e.g. NUMOTE_DDS_IFACE=wlo1
-        head = Head(int(os.environ.get("NUMOTE_DDS_DOMAIN", "0")), os.environ.get("NUMOTE_DDS_IFACE", ""))
-        head.start()
-    except Exception as e:  # SDK missing or DDS failed; everything else still works
-        print(f"head control unavailable: {e}")
+    if head:
+        head.shutdown()
+    head = GrpcHead(f"{ip}:50051")
+    head.start()
 
 def start_pad():
     pygame.display.init()
     pygame.joystick.init()
+    sdl_controller.init()
 
 def poll_pad():
-    """Read the Xbox controller through SDL (Firefox mis-reports it over Bluetooth) and drive the robot."""
-    global pad, pad_axes, buttons_down
+    """Read the controller through SDL and drive the robot."""
+    global pad, controller, controller_status, pad_axes, buttons_down
     pygame.event.pump()
+    if any(event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED) for event in pygame.event.get()):
+        pad = None
+        controller = None
+        buttons_down.clear()
+
     if pygame.joystick.get_count() == 0:
         pad = None
+        controller = None
+        controller_status = "No controller connected"
     elif pad is None:
         pad = pygame.joystick.Joystick(0)
+        controller = sdl_controller.Controller(0) if sdl_controller.is_controller(0) else None
+        mapping_status = "SDL mapping" if controller else "raw button mapping"
+        controller_status = f"{pad.get_name()} ({mapping_status})"
+        print(f"controller connected: {controller_status}")
 
-    now_down = {i for i in range(pad.get_numbuttons()) if pad.get_button(i)} if pad else set()
+    actions = controller_button_actions if controller else button_actions
+    if controller:
+        now_down = {button for button in actions if controller.get_button(button)}
+    elif pad:
+        now_down = {i for i in range(pad.get_numbuttons()) if pad.get_button(i)}
+    else:
+        now_down = set()
     for i in now_down - buttons_down:
-        name, action = button_actions.get(i, (None, None))
+        name, action = actions.get(i, (None, None))
         print(f"button {i} pressed" + (f" ({name})" if name else ""))
         if not action or not robot_ip:
             continue
+        mode_buttons = controller_mode_buttons if controller else raw_mode_buttons
         if i in mode_buttons and any(pad_axes):
             print("ignored: sticks are deflected")  # don't change mode mid-walk
             continue
@@ -71,7 +99,17 @@ def poll_pad():
 
     # d-pad is the head only; it must never touch the walking sticks below
     global head_dir
-    hat = pad.get_hat(0) if pad and pad.get_numhats() > 0 else (0, 0)
+    if controller:
+        hat = (
+            int(controller.get_button(pygame.CONTROLLER_BUTTON_DPAD_RIGHT))
+            - int(controller.get_button(pygame.CONTROLLER_BUTTON_DPAD_LEFT)),
+            int(controller.get_button(pygame.CONTROLLER_BUTTON_DPAD_UP))
+            - int(controller.get_button(pygame.CONTROLLER_BUTTON_DPAD_DOWN)),
+        )
+        if hat == (0, 0) and pad.get_numhats() > 0:
+            hat = pad.get_hat(0)
+    else:
+        hat = pad.get_hat(0) if pad and pad.get_numhats() > 0 else (0, 0)
     if hat != head_dir:
         head_dir = hat
         print(f"d-pad (head): yaw={hat[0]} pitch={hat[1]}")
@@ -107,6 +145,7 @@ def start_sender(ip):
 
     sender = Sender(f"{ip}:50051", 50, 1.0)
     sender.start()
+    start_head(ip)
 
 def extract_battery(msg: bytes):
     """Return battery value from a status (id 10000) message, or None."""
@@ -223,7 +262,6 @@ app.on_startup(lambda: robot_ip and connect(robot_ip))
 app.on_startup(lambda: robot_ip and start_sender(robot_ip))
 app.on_startup(start_discovery)
 app.on_startup(start_pad)
-app.on_startup(start_head)
 app.on_shutdown(lambda: head and head.shutdown())
 app.timer(1 / 30, poll_pad)
 app.on_shutdown(lambda: discovery_sock and discovery_sock.close())
@@ -241,6 +279,10 @@ def index():
                 ui.item(address, on_click=lambda a=address: reconnect(a))  # a=address binds this loop's value
 
     def refresh():
+        if controller_status != last.get("controller"):
+            last["controller"] = controller_status
+            controller_display.text = f"Controller: {controller_status}"
+
         if len(ip_list) != last["ips"]:  # ip_list only ever grows
             last["ips"] = len(ip_list)
             ip_menu.refresh()
@@ -337,6 +379,8 @@ def index():
                 stand_button = ui.button(text="STAND", on_click=lambda: send_robot_mode(1), **action).props("dense").classes(action_classes)
                 walk_button = ui.button(text="WALK", on_click=lambda: send_robot_mode(2), **action).props("dense").classes(action_classes)
 
+            controller_display = ui.label(f"Controller: {controller_status}").classes("w-full truncate text-center text-xs opacity-70")
+
         with ui.element("div").classes("stage"):
             img = ui.interactive_image().classes("video w-full")
             with img:
@@ -352,7 +396,7 @@ def index():
                 size=200,
             ).classes("stick-right")
 
-    last = {"n": -1, "ips": len(ip_list)}
+    last = {"n": -1, "ips": len(ip_list), "controller": controller_status}
 
     # sender is None until a robot is picked
     left_stick.on_move(lambda e: sender and sender.set(*map_stick(e.y, -e.x, max_mag)))

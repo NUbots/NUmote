@@ -218,8 +218,8 @@ class Head(threading.Thread):
     """Moves the head through the Booster SDK (DDS); holding the d-pad sweeps the target angle."""
 
     SPEED = 1.0  # rad/s
-    YAW_LIMIT = 1.0  # rad; conservative, below the hardware range
-    PITCH_MIN, PITCH_MAX = -0.3, 0.6
+    YAW_LIMIT = 0.785  # rad; documented RotateHead range is +/-0.785
+    PITCH_MIN, PITCH_MAX = -0.3, 1.0  # documented range
 
     def __init__(self, domain_id=0, interface=""):
         super().__init__(daemon=True)
