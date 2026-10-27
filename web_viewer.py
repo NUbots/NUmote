@@ -26,6 +26,10 @@ recording_lock = threading.Lock()
 video_recorder = None
 
 sender = None
+mode_client = None
+mode_sdk = None
+mode_client_error = None
+mode_client_lock = threading.Lock()
 discovery_sock = None
 max_mag = 1
 max_yaw = 1
@@ -47,6 +51,7 @@ controller_button_actions = {
     pygame.CONTROLLER_BUTTON_Y: ("Y", lambda: send_action("get_up")),
     pygame.CONTROLLER_BUTTON_X: ("X", lambda: toggle_wave()),
     pygame.CONTROLLER_BUTTON_B: ("B", lambda: send_action(KICK_ACTION)),
+    pygame.CONTROLLER_BUTTON_LEFTSTICK: ("L3", None),
     pygame.CONTROLLER_BUTTON_BACK: ("Back", lambda: send_robot_mode(1)),
     pygame.CONTROLLER_BUTTON_START: ("Start", lambda: send_robot_mode(2)),
 }
@@ -58,6 +63,31 @@ head = None
 record_combo_stage = 0
 left_trigger_was_pressed = False
 right_trigger_was_pressed = False
+
+def default_route_iface():
+    try:
+        with open("/proc/net/route") as routes:
+            for line in list(routes)[1:]:
+                name, destination, *_ = line.split()
+                if destination == "00000000":
+                    return name
+    except OSError:
+        pass
+    return ""
+
+def start_mode_client():
+    global mode_client, mode_sdk, mode_client_error
+    import booster_robotics_sdk_python as sdk
+
+    interface = os.environ.get("NUMOTE_DDS_IFACE") or default_route_iface()
+    domain_id = int(os.environ.get("NUMOTE_DDS_DOMAIN", "0"))
+    print(f"robot mode control: DDS interface {interface or '(default)'}")
+    sdk.ChannelFactory.Instance().Init(domain_id, interface)
+    client = sdk.B1LocoClient()
+    client.Init()
+    mode_client = client
+    mode_sdk = sdk
+    mode_client_error = None
 
 class VideoRecorder:
     def __init__(self):
@@ -258,7 +288,7 @@ def poll_pad():
             record_combo_stage == 2
             and left_trigger
             and right_trigger
-            and pygame.CONTROLLER_BUTTON_START in newly_pressed
+            and pygame.CONTROLLER_BUTTON_LEFTSTICK in newly_pressed
         ):
             recording_combo = True
             record_combo_stage = 0
@@ -272,7 +302,7 @@ def poll_pad():
     for i in newly_pressed:
         name, action = actions.get(i, (None, None))
         print(f"button {i} pressed" + (f" ({name})" if name else ""))
-        if recording_combo and i == pygame.CONTROLLER_BUTTON_START:
+        if recording_combo and i == pygame.CONTROLLER_BUTTON_LEFTSTICK:
             asyncio.create_task(asyncio.to_thread(toggle_video_recording))
             continue
         if not action or not robot_ip:
@@ -326,13 +356,19 @@ def poll_pad():
         sender.release_yaw()
 
 def start_sender(ip):
-    global sender
+    global sender, mode_client_error
     if sender:
         sender.shutdown()
 
     sender = Sender(f"{ip}:50051", 50, 1.0)
     sender.start()
     start_head(ip)
+    if mode_client is None or mode_sdk is None:
+        try:
+            start_mode_client()
+        except Exception as e:
+            mode_client_error = str(e)
+            print(f"robot mode control unavailable: {e}")
 
 def extract_battery(msg: bytes):
     """Return battery value from a status (id 10000) message, or None."""
@@ -407,10 +443,23 @@ def send_action(action: str, value: int = 0):
     return _send_robot_request(msg, f"action {action}")
 
 def send_robot_mode(mode: int):
-    """Set robot mode and return the robot's reported success."""
-    msg = {"request": "set_robot_mode", "params": {"mode_value": mode},
-       "language": "en", "app_api_level": 10800, "app_platform": "Android"}
-    return _send_robot_request(msg, f"robot mode {mode}")
+    """Set WALK or PREPARE mode using the Booster SDK."""
+    if mode_client is None:
+        print(f"robot mode change failed: {mode_client_error or 'SDK client is not initialized'}")
+        return False
+    sdk_mode = {1: mode_sdk.RobotMode.kPrepare, 2: mode_sdk.RobotMode.kWalking}.get(mode)
+    if sdk_mode is None:
+        print(f"robot mode change failed: unsupported mode {mode}")
+        return False
+    try:
+        with mode_client_lock:
+            mode_client.ChangeMode(sdk_mode)
+            current_mode = mode_client.GetMode()
+        print(f"robot mode requested: {sdk_mode}; current mode: {current_mode}")
+        return True
+    except Exception as e:
+        print(f"robot mode change failed: {e}")
+        return False
 
 def toggle_wave():
     # "state" is the toggle's current position, like the official app's switch:
@@ -657,4 +706,4 @@ def index():
 
     ui.timer(1 / 30, refresh)
 
-ui.run(port=8080, dark=True, title="NUmote", favicon="fav.png")
+ui.run(port=int(os.environ.get("NUMOTE_WEB_PORT", "8080")), dark=True, title="NUmote", favicon="fav.png")
