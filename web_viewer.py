@@ -35,6 +35,7 @@ controller = None
 controller_status = "No controller connected"
 pad_axes = (0.0, 0.0, 0.0, 0.0)  # lx, ly, rx, ry after dead zone
 deadzone = 0.15
+last_axis_log_at = 0.0
 # SDL joystick button index -> (name, action) on this pad
 button_actions = {
     4: ("Y", lambda: send_action("get_up")),
@@ -241,7 +242,7 @@ def start_pad():
 
 def poll_pad():
     """Read the controller through SDL and drive the robot."""
-    global pad, controller, controller_status, pad_axes, buttons_down
+    global pad, controller, controller_status, pad_axes, buttons_down, last_axis_log_at
     global record_combo_stage, left_trigger_was_pressed, right_trigger_was_pressed
     pygame.event.pump()
     if any(event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED) for event in pygame.event.get()):
@@ -339,7 +340,10 @@ def poll_pad():
         return
 
     lx, ly, rx, ry = axes
-    print(f"right=({rx:.2f}, {ry:.2f}) left=({lx:.2f}, {ly:.2f})")
+    now = time.monotonic()
+    if any(axes) and now - last_axis_log_at >= 1.0:
+        print(f"right=({rx:.2f}, {ry:.2f}) left=({lx:.2f}, {ly:.2f})")
+        last_axis_log_at = now
     if not sender:
         return
     if lx or ly:

@@ -139,6 +139,15 @@ class Sender(threading.Thread):
         self.x = self.y = self.z = 0.0
         self.move_active = self.yaw_active = False
         self.stop_pending = False
+        self.max_in_flight = 3
+        self.in_flight = 0
+        self.skipped_updates = 0
+        self.completed_calls = 0
+        self.failed_calls = 0
+        self.last_rpc_ms = 0.0
+        self.max_rpc_ms = 0.0
+        self.last_rpc_error = ""
+        self.next_diagnostic_at = time.monotonic() + 1.0
         self.running = True
         self.channel = grpc.insecure_channel(target)
         self.call = self.channel.unary_unary(
@@ -183,6 +192,31 @@ class Sender(threading.Thread):
                 pass
             time.sleep(0.02)
 
+    def _active_call_done(self, future, started_at):
+        error = ""
+        try:
+            future.result()
+        except Exception as e:
+            error = str(e)
+        elapsed_ms = (time.monotonic() - started_at) * 1000
+        with self.lock:
+            self.in_flight -= 1
+            self.completed_calls += 1
+            self.last_rpc_ms = elapsed_ms
+            self.max_rpc_ms = max(self.max_rpc_ms, elapsed_ms)
+            if error:
+                self.failed_calls += 1
+                self.last_rpc_error = error
+
+    def _active_call_submit_failed(self, started_at, error):
+        elapsed_ms = (time.monotonic() - started_at) * 1000
+        with self.lock:
+            self.in_flight -= 1
+            self.failed_calls += 1
+            self.last_rpc_ms = elapsed_ms
+            self.max_rpc_ms = max(self.max_rpc_ms, elapsed_ms)
+            self.last_rpc_error = str(error)
+
     def run(self):
         nxt = time.monotonic()
         while self.running:
@@ -191,10 +225,42 @@ class Sender(threading.Thread):
                 active = self.move_active or self.yaw_active
                 if stop:
                     self.stop_pending = False
+                send_active = active and self.in_flight < self.max_in_flight
+                if active and not send_active:
+                    self.skipped_updates += 1
+                if send_active:
+                    self.in_flight += 1
             if stop:
                 self._send_stop()
-            elif active:
-                self.call.future(joystick_message(x, y, z), timeout=self.timeout)
+            elif send_active:
+                started_at = time.monotonic()
+                try:
+                    future = self.call.future(joystick_message(x, y, z), timeout=self.timeout)
+                    future.add_done_callback(lambda result, started=started_at: self._active_call_done(result, started))
+                except Exception as e:
+                    self._active_call_submit_failed(started_at, e)
+
+            now = time.monotonic()
+            if now >= self.next_diagnostic_at:
+                with self.lock:
+                    in_flight = self.in_flight
+                    skipped = self.skipped_updates
+                    completed = self.completed_calls
+                    failures = self.failed_calls
+                    last_rpc_ms = self.last_rpc_ms
+                    max_rpc_ms = self.max_rpc_ms
+                    last_error = self.last_rpc_error
+                    self.skipped_updates = 0
+                    self.completed_calls = 0
+                    self.failed_calls = 0
+                    self.max_rpc_ms = 0.0
+                error = f", last_error={last_error}" if last_error else ""
+                print(
+                    f"joystick rpc: completed={completed}, failed={failures}, "
+                    f"in_flight={in_flight}/{self.max_in_flight}, skipped={skipped}, "
+                    f"last={last_rpc_ms:.1f} ms, max={max_rpc_ms:.1f} ms{error}"
+                )
+                self.next_diagnostic_at = now + 1.0
             nxt += self.dt
             delay = nxt - time.monotonic()
             if delay > 0:
