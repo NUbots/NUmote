@@ -17,12 +17,15 @@ ip_list = [] # this is the list of discovered Robot IPs
 video_stream_port = 51111 # this seems to be standard for the Boosters.
 discovery_port = 9000 # found with WireShark
 KICK_ACTION = os.environ.get("NUMOTE_KICK_ACTION", "kick")
+SOCCER_AGENT_ID = "com.boosterobotics.soccer"
+SOCCER_KICK_ACTION = os.environ.get("NUMOTE_SOCCER_KICK_ACTION_ID", "visual_kick_ball")
 
-state = {"jpeg": None, "battery": 0, "count": 0, "waving": False, "chasing": False}
+state = {"jpeg": None, "battery": 0, "count": 0, "waving": False, "chasing": False, "kick_used": False}
 recording_status = "Not recording"
 recording_active = False
 recording_stopping = False
 recording_lock = threading.Lock()
+kick_action_lock = threading.Lock()
 video_recorder = None
 
 sender = None
@@ -40,14 +43,14 @@ last_axis_log_at = 0.0
 button_actions = {
     4: ("Y", lambda: send_action("get_up")),
     3: ("X", lambda: toggle_wave()),
-    1: ("B", lambda: send_action(KICK_ACTION)),
+    1: ("B", lambda: send_soccer_kick_once()),
     10: ("Back", lambda: send_robot_mode(1)),   # STAND
     11: ("Start", lambda: send_robot_mode(2)),  # WALK
 }
 controller_button_actions = {
     pygame.CONTROLLER_BUTTON_Y: ("Y", lambda: send_action("get_up")),
     pygame.CONTROLLER_BUTTON_X: ("X", lambda: toggle_wave()),
-    pygame.CONTROLLER_BUTTON_B: ("B", lambda: send_action(KICK_ACTION)),
+    pygame.CONTROLLER_BUTTON_B: ("B", lambda: send_soccer_kick_once()),
     pygame.CONTROLLER_BUTTON_RIGHTSHOULDER: ("RB", None),
     pygame.CONTROLLER_BUTTON_LEFTSTICK: ("L3", None),
     pygame.CONTROLLER_BUTTON_BACK: ("Back", lambda: send_robot_mode(1)),
@@ -451,7 +454,28 @@ def send_action(action: str, value: int = 0, agent: str = "com.boosterobotics.de
         "app_api_level": 10800,
         "app_platform": "Android",
     }
-    return _send_robot_request(msg, f"action {action}")
+    return _send_robot_request(msg, f"action {action} agent={agent}")
+
+def send_soccer_kick_once():
+    with kick_action_lock:
+        if state["kick_used"]:
+            print("Soccer Kick Ball ignored: already accepted; press RB to re-arm")
+            return False
+        state["kick_used"] = True
+
+    try:
+        succeeded = send_action(SOCCER_KICK_ACTION, agent=SOCCER_AGENT_ID)
+    except Exception as e:
+        print(f"Soccer Kick Ball request failed: {e}")
+        succeeded = False
+
+    if not succeeded:
+        with kick_action_lock:
+            state["kick_used"] = False
+        return False
+
+    print("Soccer Kick Ball accepted; repeat B presses are locked until RB re-arms")
+    return True
 
 def send_robot_mode(mode: int):
     """Switch between STAND and WALK through the robot's app control endpoint."""
@@ -496,13 +520,15 @@ async def toggle_chase(notify_user: bool = True):
     if not state["chasing"]:
         # starting an already running agent replies just_started false, so this is safe to send every time
         try:
-            reply = await asyncio.to_thread(start_agent, "com.boosterobotics.soccer")
+            reply = await asyncio.to_thread(start_agent, SOCCER_AGENT_ID)
         except Exception as e:
             report(f"Couldn't start the Soccer agent: {e}", "negative")
             return
         if not reply.get("success"):
             report("Couldn't start the Soccer agent", "negative")
             return
+        with kick_action_lock:
+            state["kick_used"] = False
         if reply.get("result", {}).get("just_started"):
             report("Switching to Soccer agent...")
             await asyncio.sleep(4)  # its buttons show up ~2.7 s after start_agent
@@ -511,7 +537,7 @@ async def toggle_chase(notify_user: bool = True):
             send_action,
             "chase_ball",
             1 if state["chasing"] else 0,
-            "com.boosterobotics.soccer",
+            SOCCER_AGENT_ID,
         )
     except Exception as e:
         report(f"Chase Ball request failed: {e}", "negative")
