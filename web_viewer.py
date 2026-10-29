@@ -20,13 +20,21 @@ KICK_ACTION = os.environ.get("NUMOTE_KICK_ACTION", "kick")
 SOCCER_AGENT_ID = "com.boosterobotics.soccer"
 SOCCER_KICK_ACTION = os.environ.get("NUMOTE_SOCCER_KICK_ACTION_ID", "visual_kick_ball")
 
-state = {"jpeg": None, "battery": 0, "count": 0, "waving": False, "chasing": False, "kick_used": False}
+CAMERAS = ("left", "right")  # index matches the camera id sent by k1_camera_relay.py
+CAMERA_RELAY_PORT = int(os.environ.get("NUMOTE_CAMERA_RELAY_PORT", "51120"))
+relay_frame_at = 0.0  # monotonic time of the last relay frame
+
+state = {
+    "jpeg": {cam: None for cam in CAMERAS},
+    "count": {cam: 0 for cam in CAMERAS},
+    "battery": 0, "waving": False, "chasing": False, "kick_used": False,
+}
 recording_status = "Not recording"
 recording_active = False
 recording_stopping = False
 recording_lock = threading.Lock()
 kick_action_lock = threading.Lock()
-video_recorder = None
+video_recorders = {}  # camera -> VideoRecorder
 
 sender = None
 discovery_sock = None
@@ -73,14 +81,13 @@ right_trigger_was_pressed = False
 class VideoRecorder:
     FPS = 30
 
-    def __init__(self):
+    def __init__(self, output_dir, camera):
         ffmpeg = shutil.which(os.environ.get("NUMOTE_FFMPEG", "ffmpeg"))
         if not ffmpeg:
             raise RuntimeError("FFmpeg was not found; install it or set NUMOTE_FFMPEG")
 
-        output_dir = Path(os.environ.get("NUMOTE_RECORDING_DIR", Path(__file__).resolve().parent / "recordings"))
         output_dir.mkdir(parents=True, exist_ok=True)
-        self.path = output_dir / f"numote_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.mp4"
+        self.path = output_dir / f"{camera}.mp4"
         self.frames = queue.Queue(maxsize=120)
         self.frame_interval = 1.0 / self.FPS
         self.schedule_lock = threading.Lock()
@@ -172,67 +179,128 @@ class VideoRecorder:
             raise RuntimeError(self.error)
         return self.path
 
+def stop_recorders(recorders):
+    """Stop every recorder; returns (saved descriptions, error descriptions)."""
+    saved, errors = [], []
+    for recorder in recorders.values():
+        try:
+            path = recorder.stop()
+            dropped = f" ({recorder.dropped_frames} frames dropped)" if recorder.dropped_frames else ""
+            saved.append(f"{path.name}{dropped}")
+        except Exception as e:
+            errors.append(f"{recorder.path.name}: {e}")
+    return saved, errors
+
 def toggle_video_recording():
-    global video_recorder, recording_status, recording_active, recording_stopping
+    global video_recorders, recording_status, recording_active, recording_stopping
     with recording_lock:
         if recording_stopping:
             return
-        if video_recorder is None:
-            if not state["jpeg"]:
+        if not video_recorders:
+            cameras = [cam for cam in CAMERAS if state["jpeg"][cam]]
+            if not cameras:
                 recording_status = "No video stream to record"
                 return
+            recordings_root = Path(os.environ.get("NUMOTE_RECORDING_DIR", Path(__file__).resolve().parent / "recordings"))
+            output_dir = recordings_root / f"numote_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            recorders = {}
             try:
-                video_recorder = VideoRecorder()
+                for cam in cameras:
+                    recorders[cam] = VideoRecorder(output_dir, cam)
             except Exception as e:
+                stop_recorders(recorders)
                 recording_status = f"Recording failed: {e}"
                 print(recording_status)
                 return
+            video_recorders = recorders
             recording_active = True
-            recording_status = f"Recording: {video_recorder.path.name}"
+            recording_status = f"Recording to {output_dir.name}/: " + ", ".join(r.path.name for r in recorders.values())
             print(recording_status)
             return
         recording_active = False
         recording_stopping = True
-        current_recorder = video_recorder
-        video_recorder = None
+        current_recorders = video_recorders
+        video_recorders = {}
         recording_status = "Finalizing recording..."
 
     try:
-        path = current_recorder.stop()
-        recording_status = f"Saved: {path}"
-        if current_recorder.dropped_frames:
-            recording_status += f" ({current_recorder.dropped_frames} frames dropped)"
-        print(recording_status)
-    except Exception as e:
-        recording_status = f"Recording failed: {e}"
+        output_dir = next(iter(current_recorders.values())).path.parent
+        saved, errors = stop_recorders(current_recorders)
+        recording_status = "; ".join(
+            ([f"Saved to {output_dir}: " + ", ".join(saved)] if saved else [])
+            + (["Recording failed: " + ", ".join(errors)] if errors else [])
+        )
         print(recording_status)
     finally:
         with recording_lock:
             recording_stopping = False
             recording_active = False
 
-def add_recording_frame(frame):
+def add_recording_frame(cam, frame):
     with recording_lock:
-        current_recorder = video_recorder
-    if current_recorder:
-        current_recorder.add_frame(frame)
+        recorder = video_recorders.get(cam)
+    if recorder:
+        recorder.add_frame(frame)
+
+def on_frame(cam, jpeg):
+    state["jpeg"][cam] = jpeg
+    state["count"][cam] += 1
+    add_recording_frame(cam, jpeg)
+
+def relay_active():
+    return time.monotonic() - relay_frame_at < 2.0
+
+def clear_frames(cameras):
+    for cam in cameras:
+        if state["jpeg"][cam]:
+            state["jpeg"][cam] = None
+            state["count"][cam] += 1
+
+async def relay_loop(ip):
+    """Both head cameras from k1_camera_relay.py running on the robot."""
+    global relay_frame_at
+    last_error = None
+    while True:
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, CAMERA_RELAY_PORT), timeout=5)
+            print(f"camera relay connected ({ip}:{CAMERA_RELAY_PORT})")
+            last_error = None
+            while True:
+                cam, size = struct.unpack("<BI", await asyncio.wait_for(reader.readexactly(5), timeout=5))
+                jpeg = await reader.readexactly(size)
+                if cam < len(CAMERAS):
+                    relay_frame_at = time.monotonic()
+                    on_frame(CAMERAS[cam], jpeg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            if error != last_error:  # the relay may simply not be running; don't spam
+                print(f"camera relay unavailable ({error}); showing the app stream, retrying every 2s")
+                last_error = error
+            clear_frames(CAMERAS[1:])
+        finally:
+            if writer:
+                writer.close()
+        await asyncio.sleep(2)
 
 def trigger_pressed(value):
     return value > (0.5 if abs(value) <= 1 else 16384)
 
 def shutdown_video_recording():
-    global video_recorder, recording_active, recording_stopping
+    global video_recorders, recording_active, recording_stopping
     with recording_lock:
-        if video_recorder is None or recording_stopping:
+        if not video_recorders or recording_stopping:
             return
         recording_active = False
         recording_stopping = True
-        current_recorder = video_recorder
-        video_recorder = None
+        current_recorders = video_recorders
+        video_recorders = {}
     try:
-        current_recorder.stop()
-    except Exception as e:
-        print(f"recording shutdown failed: {e}")
+        _, errors = stop_recorders(current_recorders)
+        if errors:
+            print(f"recording shutdown failed: {', '.join(errors)}")
     finally:
         with recording_lock:
             recording_stopping = False
@@ -576,27 +644,28 @@ async def ws_loop(url):
                     if isinstance(msg, bytes):
                         if (b := extract_battery(msg)) is not None:
                             state["battery"] = b
-                        elif (j := extract_jpeg(msg)):
-                            state["jpeg"] = j
-                            state["count"] += 1
-                            add_recording_frame(j)
+                        elif not relay_active() and (j := extract_jpeg(msg)):
+                            on_frame(CAMERAS[0], j)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             print(f"ws error ({url}): {e}; retrying in 2s")
-            if state["jpeg"]:  # show the no-video frame while disconnected
-                state["jpeg"] = None
-                state["count"] += 1
+            if not relay_active():  # show the no-video frame while disconnected
+                clear_frames(CAMERAS[:1])
             await asyncio.sleep(2)
 
 ws_task = None
+relay_task = None
 
 def connect(ip):
-    global ws_task
-    if ws_task:
-        ws_task.cancel()
-    state.update(jpeg=None, battery=0, count=0, waving=False, chasing=False)
+    global ws_task, relay_task
+    for task in (ws_task, relay_task):
+        if task:
+            task.cancel()
+    state.update(battery=0, waving=False, chasing=False)
+    clear_frames(CAMERAS)
     ws_task = asyncio.create_task(ws_loop(f"ws://{ip}:{video_stream_port}/"))
+    relay_task = asyncio.create_task(relay_loop(ip))
 
 # only auto-connect if an IP is hardcoded above; otherwise wait for one to be picked from the menu
 app.on_startup(lambda: robot_ip and connect(robot_ip))
@@ -644,12 +713,16 @@ def index():
             last["chasing"] = state["chasing"]
             chase_button.text = "STOP CHASE" if state["chasing"] else "CHASE"
 
-        if state["count"] != last["n"]:
-            last["n"] = state["count"]
-            if state["jpeg"]:
-                img.set_source("data:image/jpeg;base64," + base64.b64encode(state["jpeg"]).decode())
+        for cam, img in imgs.items():
+            if state["count"][cam] == last["n"].get(cam):
+                continue
+            last["n"][cam] = state["count"][cam]
+            jpeg = state["jpeg"][cam]
+            if jpeg:
+                img.set_source("data:image/jpeg;base64," + base64.b64encode(jpeg).decode())
             else:
                 img.set_source("no_video.jpg")
+        apply_video_layout()
 
         # decode some battery stuff and update the battery label
         b = state["battery"]
@@ -677,6 +750,24 @@ def index():
 
     async def toggle_recording_from_ui():
         await asyncio.to_thread(toggle_video_recording)
+
+    def apply_video_layout():
+        # the second view stays hidden until it has frames
+        live = {cam: cam == CAMERAS[0] or state["jpeg"][cam] is not None for cam in CAMERAS}
+        if focus["cam"] and not live[focus["cam"]]:
+            focus["cam"] = None
+        visible = tuple(live[cam] and focus["cam"] in (None, cam) for cam in CAMERAS)
+        if visible != last.get("visible"):
+            last["visible"] = visible
+            for img, shown in zip(imgs.values(), visible):
+                img.set_visibility(shown)
+
+    def toggle_focus(cam):
+        """Tap a feed to fill the video area with it; tap again to go back to side by side."""
+        focus["cam"] = None if focus["cam"] == cam else cam
+        apply_video_layout()
+
+    focus = {"cam": None}  # per page, so each viewer picks its own layout
 
     ui.add_css("""
         .nicegui-content { padding: 0.5rem; }
@@ -741,9 +832,11 @@ def index():
             recording_display = ui.label(recording_status).classes("w-full truncate text-center text-xs opacity-70")
 
         with ui.element("div").classes("stage"):
-            img = ui.interactive_image().classes("video w-full")
-            with img:
-                ui.button(icon="fullscreen", on_click=lambda: ui.run_javascript(f"getHtmlElement({img.id}).requestFullscreen()")).props("flat round dense color=white").classes("absolute top-2 right-2")
+            with ui.element("div").classes("video w-full relative flex gap-1") as video:
+                imgs = {cam: ui.interactive_image().classes("min-w-0 flex-1 cursor-pointer") for cam in CAMERAS}
+                for cam, img in imgs.items():
+                    img.on("click", lambda _, cam=cam: toggle_focus(cam))
+                ui.button(icon="fullscreen", on_click=lambda: ui.run_javascript(f"getHtmlElement({video.id}).requestFullscreen()")).props("flat round dense color=white").classes("absolute top-2 right-2")
             left_stick = ui.joystick(
                 color='#FFAE00',
                 mode='static',
@@ -756,7 +849,7 @@ def index():
             ).classes("stick-right")
 
     last = {
-        "n": -1,
+        "n": {},
         "ips": len(ip_list),
         "controller": controller_status,
         "recording_status": recording_status,
