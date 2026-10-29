@@ -9,7 +9,7 @@ import pygame._sdl2.controller as sdl_controller
 from nicegui import app, ui
 from gprc_head import GrpcHead
 from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
-import json, socket
+import hashlib, hmac, json, secrets, socket
 
 robot_ip = "" # empty for now
 ip_list = [] # this is the list of discovered Robot IPs
@@ -19,6 +19,8 @@ discovery_port = 9000 # found with WireShark
 KICK_ACTION = os.environ.get("NUMOTE_KICK_ACTION", "kick")
 SOCCER_AGENT_ID = "com.boosterobotics.soccer"
 SOCCER_KICK_ACTION = os.environ.get("NUMOTE_SOCCER_KICK_ACTION_ID", "visual_kick_ball")
+STRONG_KICK_PORT = int(os.environ.get("NUMOTE_STRONG_KICK_PORT", "51121"))
+STRONG_KICK_TOKEN = os.environ.get("NUMOTE_STRONG_KICK_TOKEN", "")
 
 CAMERAS = ("left", "right")  # index matches the camera id sent by k1_camera_relay.py
 CAMERA_RELAY_PORT = int(os.environ.get("NUMOTE_CAMERA_RELAY_PORT", "51120"))
@@ -27,13 +29,12 @@ relay_frame_at = 0.0  # monotonic time of the last relay frame
 state = {
     "jpeg": {cam: None for cam in CAMERAS},
     "count": {cam: 0 for cam in CAMERAS},
-    "battery": 0, "waving": False, "chasing": False, "kick_used": False,
+    "battery": 0, "waving": False, "chasing": False,
 }
 recording_status = "Not recording"
 recording_active = False
 recording_stopping = False
 recording_lock = threading.Lock()
-kick_action_lock = threading.Lock()
 video_recorders = {}  # camera -> VideoRecorder
 
 sender = None
@@ -49,16 +50,18 @@ deadzone = 0.15
 last_axis_log_at = 0.0
 # SDL joystick button index -> (name, action) on this pad
 button_actions = {
+    0: ("A", lambda: send_random_dance()),
     4: ("Y", lambda: send_action("get_up")),
     3: ("X", lambda: toggle_wave()),
-    1: ("B", lambda: send_soccer_kick_once()),
+    1: ("B", lambda: send_soccer_kick()),
     10: ("Back", lambda: send_robot_mode(1)),   # STAND
     11: ("Start", lambda: send_robot_mode(2)),  # WALK
 }
 controller_button_actions = {
+    pygame.CONTROLLER_BUTTON_A: ("A", lambda: send_random_dance()),
     pygame.CONTROLLER_BUTTON_Y: ("Y", lambda: send_action("get_up")),
     pygame.CONTROLLER_BUTTON_X: ("X", lambda: toggle_wave()),
-    pygame.CONTROLLER_BUTTON_B: ("B", lambda: send_soccer_kick_once()),
+    pygame.CONTROLLER_BUTTON_B: ("B", lambda: send_soccer_kick()),
     pygame.CONTROLLER_BUTTON_RIGHTSHOULDER: ("RB", None),
     pygame.CONTROLLER_BUTTON_LEFTSTICK: ("L3", None),
     pygame.CONTROLLER_BUTTON_BACK: ("Back", lambda: send_robot_mode(1)),
@@ -383,6 +386,8 @@ def poll_pad():
 
     for i in newly_pressed:
         name, action = actions.get(i, (None, None))
+        if controller and i == pygame.CONTROLLER_BUTTON_B and right_trigger:
+            name, action = "B+RT", send_strong_kick
         print(f"button {i} pressed" + (f" ({name})" if name else ""))
         if recording_combo and i == pygame.CONTROLLER_BUTTON_LEFTSTICK:
             asyncio.create_task(asyncio.to_thread(toggle_video_recording))
@@ -524,13 +529,72 @@ def send_action(action: str, value: int = 0, agent: str = "com.boosterobotics.de
     }
     return _send_robot_request(msg, f"action {action} agent={agent}")
 
-def send_soccer_kick_once():
-    with kick_action_lock:
-        if state["kick_used"]:
-            print("Soccer Kick Ball ignored: already accepted; press RB to re-arm")
-            return False
-        state["kick_used"] = True
+def send_relay_command(command):
+    label = "Strong Kick" if command == "shoot" else "Random Dance"
+    if not robot_ip:
+        print(f"{label} failed: no robot selected")
+        return None
+    if not STRONG_KICK_TOKEN:
+        print(f"{label} disabled: set NUMOTE_STRONG_KICK_TOKEN on the app and robot")
+        return None
 
+    timestamp = int(time.time())
+    nonce = secrets.token_hex(16)
+    signature = hmac.new(
+        STRONG_KICK_TOKEN.encode(),
+        f"{command}\n{timestamp}\n{nonce}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    request = {
+        "command": command,
+        "timestamp": timestamp,
+        "nonce": nonce,
+        "signature": signature,
+    }
+    try:
+        with socket.create_connection((robot_ip, STRONG_KICK_PORT), timeout=5) as conn:
+            conn.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+            with conn.makefile("rb") as response_stream:
+                response_line = response_stream.readline(4097)
+        if not response_line:
+            raise ConnectionError("robot-action relay closed without a response")
+        response = json.loads(response_line)
+        succeeded = response.get("success") is True
+        if not succeeded:
+            print(f"{label} rejected: {response.get('error', 'relay request failed')}")
+    except Exception as e:
+        print(f"{label} request failed: {e}")
+        succeeded = False
+
+    if not succeeded:
+        return None
+    return response
+
+
+def send_strong_kick():
+    if not send_relay_command("shoot"):
+        return False
+    print("Strong Kick accepted")
+    return True
+
+
+def send_random_dance():
+    response = send_relay_command("dance")
+    if not response:
+        return None
+    dance_name = response.get("dance", "random dance")
+    print(f"Random dance accepted: {dance_name}")
+    return dance_name
+
+
+async def random_dance_from_ui():
+    dance_name = await asyncio.to_thread(send_random_dance)
+    if dance_name:
+        ui.notify(f"Playing {dance_name}")
+    else:
+        ui.notify("Dance request failed", type="negative")
+
+def send_soccer_kick():
     try:
         succeeded = send_action(SOCCER_KICK_ACTION, agent=SOCCER_AGENT_ID)
     except Exception as e:
@@ -538,11 +602,9 @@ def send_soccer_kick_once():
         succeeded = False
 
     if not succeeded:
-        with kick_action_lock:
-            state["kick_used"] = False
         return False
 
-    print("Soccer Kick Ball accepted; repeat B presses are locked until RB re-arms")
+    print("Soccer Kick Ball accepted")
     return True
 
 def send_robot_mode(mode: int):
@@ -595,8 +657,6 @@ async def toggle_chase(notify_user: bool = True):
         if not reply.get("success"):
             report("Couldn't start the Soccer agent", "negative")
             return
-        with kick_action_lock:
-            state["kick_used"] = False
         if reply.get("result", {}).get("just_started"):
             report("Switching to Soccer agent...")
             await asyncio.sleep(4)  # its buttons show up ~2.7 s after start_agent
@@ -827,6 +887,7 @@ def index():
                 stand_button = ui.button(text="STAND", on_click=lambda: send_robot_mode(1), **action).props("dense").classes(action_classes)
                 walk_button = ui.button(text="WALK", on_click=lambda: send_robot_mode(2), **action).props("dense").classes(action_classes)
                 recording_button = ui.button(text="RECORD", on_click=toggle_recording_from_ui, **action).props("dense").classes(action_classes)
+                dance_button = ui.button(text="DANCE", on_click=random_dance_from_ui, **action).props("dense").classes(action_classes)
 
             controller_display = ui.label(f"Controller: {controller_status}").classes("w-full truncate text-center text-xs opacity-70")
             recording_display = ui.label(recording_status).classes("w-full truncate text-center text-xs opacity-70")
