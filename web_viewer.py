@@ -18,7 +18,7 @@ video_stream_port = 51111 # this seems to be standard for the Boosters.
 discovery_port = 9000 # found with WireShark
 KICK_ACTION = os.environ.get("NUMOTE_KICK_ACTION", "kick")
 
-state = {"jpeg": None, "battery": 0, "count": 0, "waving": False}
+state = {"jpeg": None, "battery": 0, "count": 0, "waving": False, "chasing": False}
 recording_status = "Not recording"
 recording_active = False
 recording_stopping = False
@@ -48,6 +48,7 @@ controller_button_actions = {
     pygame.CONTROLLER_BUTTON_Y: ("Y", lambda: send_action("get_up")),
     pygame.CONTROLLER_BUTTON_X: ("X", lambda: toggle_wave()),
     pygame.CONTROLLER_BUTTON_B: ("B", lambda: send_action(KICK_ACTION)),
+    pygame.CONTROLLER_BUTTON_RIGHTSHOULDER: ("RB", None),
     pygame.CONTROLLER_BUTTON_LEFTSTICK: ("L3", None),
     pygame.CONTROLLER_BUTTON_BACK: ("Back", lambda: send_robot_mode(1)),
     pygame.CONTROLLER_BUTTON_START: ("Start", lambda: send_robot_mode(2)),
@@ -315,6 +316,9 @@ def poll_pad():
         if recording_combo and i == pygame.CONTROLLER_BUTTON_LEFTSTICK:
             asyncio.create_task(asyncio.to_thread(toggle_video_recording))
             continue
+        if controller and i == pygame.CONTROLLER_BUTTON_RIGHTSHOULDER:
+            asyncio.create_task(toggle_chase(notify_user=False))
+            continue
         if not action or not robot_ip:
             continue
         mode_buttons = controller_mode_buttons if controller else raw_mode_buttons
@@ -437,11 +441,11 @@ def _send_robot_request(msg, label):
     print(response_text)
     return succeeded
 
-def send_action(action: str, value: int = 0):
-    """Send an agent button press and return the robot's reported success."""
+def send_action(action: str, value: int = 0, agent: str = "com.boosterobotics.default"):
+    """Send an agent button press. Returns True if the robot answered."""
     msg = {
         "request": "send_to_agent",
-        "params": {"agent_id": "com.boosterobotics.default"},
+        "params": {"agent_id": agent},
         "agent_req": {"event": "on_component_click", "component_id": action, "state": value},
         "language": "en",
         "app_api_level": 10800,
@@ -465,6 +469,58 @@ def toggle_wave():
     # 0 (currently off) starts the wave, 1 (currently on) stops it
     if send_action("wave", 1 if state["waving"] else 0):
         state["waving"] = not state["waving"]  # only flip once the robot has the command
+
+def start_agent(agent: str):
+    """Switch the robot to another agent. Returns the robot's reply, e.g. {"result":{"just_started":true},"success":true}."""
+    msg = {"request": "start_agent", "params": {"id": agent},
+       "language": "en", "app_api_level": 10800, "app_platform": "Android"}
+    body = json.dumps(msg, separators=(",", ":")).encode()
+
+    with socket.create_connection((robot_ip, 6868), timeout=5) as s:
+        s.sendall(struct.pack("<I", len(body)) + body)
+        n = struct.unpack("<I", s.recv(4))[0]
+        reply = s.recv(n).decode()
+        print(reply)
+    return json.loads(reply)
+
+async def toggle_chase(notify_user: bool = True):
+    def report(message, notification_type="info"):
+        print(f"chase: {message}")
+        if notify_user:
+            ui.notify(message, type=notification_type)
+
+    # same toggle as wave, but chase_ball lives on the soccer agent
+    if not robot_ip:
+        report("No robot selected", "warning")
+        return
+    if not state["chasing"]:
+        # starting an already running agent replies just_started false, so this is safe to send every time
+        try:
+            reply = await asyncio.to_thread(start_agent, "com.boosterobotics.soccer")
+        except Exception as e:
+            report(f"Couldn't start the Soccer agent: {e}", "negative")
+            return
+        if not reply.get("success"):
+            report("Couldn't start the Soccer agent", "negative")
+            return
+        if reply.get("result", {}).get("just_started"):
+            report("Switching to Soccer agent...")
+            await asyncio.sleep(4)  # its buttons show up ~2.7 s after start_agent
+    try:
+        succeeded = await asyncio.to_thread(
+            send_action,
+            "chase_ball",
+            1 if state["chasing"] else 0,
+            "com.boosterobotics.soccer",
+        )
+    except Exception as e:
+        report(f"Chase Ball request failed: {e}", "negative")
+        return
+    if succeeded:
+        state["chasing"] = not state["chasing"]
+        report("Chase Ball started" if state["chasing"] else "Chase Ball stopped")
+    else:
+        report("Chase Ball request was rejected", "negative")
 
 def start_discovery():
     global discovery_sock
@@ -513,7 +569,7 @@ def connect(ip):
     global ws_task
     if ws_task:
         ws_task.cancel()
-    state.update(jpeg=None, battery=0, count=0, waving=False)
+    state.update(jpeg=None, battery=0, count=0, waving=False, chasing=False)
     ws_task = asyncio.create_task(ws_loop(f"ws://{ip}:{video_stream_port}/"))
 
 # only auto-connect if an IP is hardcoded above; otherwise wait for one to be picked from the menu
@@ -557,6 +613,10 @@ def index():
         if state["waving"] != last.get("waving"):  # global, so every open page shows the same
             last["waving"] = state["waving"]
             wave_button.text = "STOP WAVE" if state["waving"] else "WAVE"
+
+        if state["chasing"] != last.get("chasing"):
+            last["chasing"] = state["chasing"]
+            chase_button.text = "STOP CHASE" if state["chasing"] else "CHASE"
 
         if state["count"] != last["n"]:
             last["n"] = state["count"]
@@ -640,13 +700,13 @@ def index():
                 with battery_display:
                     battery_label = ui.label().classes("absolute-center text-xs sm:text-sm text-white")
 
-            # phone: full-width 4-column row under the header. desktop: inline at the end.
-            with ui.element("div").classes("grid grid-cols-6 gap-2 w-full sm:flex sm:w-auto"):
+            # phone: full-width 5-column row under the header. desktop: inline at the end.
+            with ui.element("div").classes("grid grid-cols-5 gap-2 w-full sm:flex sm:w-auto"):
                 action = dict(color="#FFAE00")
                 action_classes = "min-w-0 px-1 text-xs sm:px-3 sm:text-sm"
                 get_up_button = ui.button(text="GET UP", on_click=lambda: send_action("get_up"), **action).props("dense").classes(action_classes)
                 wave_button = ui.button(text="WAVE", on_click=toggle_wave, **action).props("dense").classes(action_classes)
-                kick_button = ui.button(text="KICK", on_click=lambda: send_action(KICK_ACTION), **action).props("dense").classes(action_classes)
+                chase_button = ui.button(text="CHASE", on_click=toggle_chase, **action).props("dense").classes(action_classes)
                 stand_button = ui.button(text="STAND", on_click=lambda: send_robot_mode(1), **action).props("dense").classes(action_classes)
                 walk_button = ui.button(text="WALK", on_click=lambda: send_robot_mode(2), **action).props("dense").classes(action_classes)
                 recording_button = ui.button(text="RECORD", on_click=toggle_recording_from_ui, **action).props("dense").classes(action_classes)
