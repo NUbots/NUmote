@@ -867,11 +867,14 @@ def index():
     def mapping_view():
         ui.html(mapping_html(), sanitize=False).classes("w-full")
 
+    def open_mapping():
+        mapping_view.refresh()  # rebuilt per open, so it always matches the connected pad
+        mapping_dialog.open()
+
     def refresh():
         if controller_status != last.get("controller"):
             last["controller"] = controller_status
             controller_display.text = f"Controller: {controller_status}"
-            mapping_view.refresh()
 
         if recording_status != last.get("recording_status"):
             last["recording_status"] = recording_status
@@ -1011,7 +1014,7 @@ def index():
                     ui.label("Controller mapping").classes("text-lg font-medium")
                     ui.button(icon="close", on_click=lambda: mapping_dialog.close()).props("flat round dense")
                 mapping_view()
-            ui.button(icon="sports_esports", on_click=mapping_dialog.open).props("flat round dense color=white").tooltip("Controller mapping")
+            ui.button(icon="sports_esports", on_click=open_mapping).props("flat round dense color=white").tooltip("Controller mapping")
 
             # phone: small fixed-width bar. desktop: stretches to fill the line.
             with ui.row().classes("w-20 items-center no-wrap gap-2 sm:flex-1 sm:w-auto sm:min-w-24"):
