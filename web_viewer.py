@@ -786,7 +786,6 @@ def wait_for_bridge_report(listener, nonce, ssh_process, timeout):
             return True
     return False
 
-
 def start_bridge_on_robot(robot_ip):
     """(Re)start the bridge on the robot. Returns True once the bridge reports back that its ports are open."""
     if not robot_ip:
@@ -878,6 +877,32 @@ done
             f"and its log at ~/{posixpath.join(SCP_LOCATION, 'NUmote_bridge.log')}"
         )
     return False
+
+def start_bridged_mode(robot_ip):
+    # regular mode will work on the usual robot <-> app comms
+    # bridged mode gives you more features, but relies on a bridge script running on board the robot.
+
+    # returns True once the bridge is running; if not, regular mode is all that's available.
+
+    bridge_current = confirm_bridge_with_robot(robot_ip)
+    if bridge_current is None:  # couldn't reach the robot or read its checksum, so don't touch its copy
+        print("Bridged mode unavailable: could not check the robot's bridge")
+        return False
+
+    if not bridge_current and not transfer_bridge_to_robot(robot_ip):
+        print("Bridged mode unavailable: could not update the robot's bridge")
+        return False
+
+    return start_bridge_on_robot(robot_ip)
+
+
+bridge_start_lock = threading.Lock()
+
+def start_bridged_mode_for_connection(ip):
+    # runs on its own thread so connect() doesn't wait on SSH; relay_loop picks the bridge up once it's running.
+    with bridge_start_lock:  # a second start would kill the bridge the first is still waiting on
+        if ip == robot_ip:  # otherwise another robot was picked while this one waited its turn
+            start_bridged_mode(ip)
 
 
 def send_random_dance():
@@ -1028,13 +1053,11 @@ def connect(ip):
     clear_frames(CAMERAS)
     ws_task = asyncio.create_task(ws_loop(f"ws://{ip}:{video_stream_port}/"))
     relay_task = asyncio.create_task(relay_loop(ip))
+    threading.Thread(target=start_bridged_mode_for_connection, args=(ip,), daemon=True).start()
 
 # only auto-connect if an IP is hardcoded above; otherwise wait for one to be picked from the menu
 app.on_startup(lambda: robot_ip and connect(robot_ip))
 app.on_startup(lambda: robot_ip and start_sender(robot_ip))
-app.on_startup(lambda: confirm_bridge_with_robot("10.0.1.150"))
-app.on_startup(lambda: transfer_bridge_to_robot("10.0.1.150"))
-app.on_startup(lambda: start_bridge_on_robot("10.0.1.150"))
 app.on_startup(start_discovery)
 app.on_startup(start_pad)
 app.on_shutdown(lambda: head and head.shutdown())
