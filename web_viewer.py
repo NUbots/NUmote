@@ -75,7 +75,7 @@ switch_controller_button_actions = {
 }
 # keyed by printed button name; the Switch dict relabels so a name means the same action on every layout
 action_descriptions = {
-    "A": "Random dance", "B": "Kick (hold RT: strong kick)", "X": "Toggle wave",
+    "A": "Random dance", "B": "Kick", "X": "Toggle wave",
     "Y": "Get up", "RB": "Toggle chase", "Back": "Stand", "Start": "Walk",
 }
 # printed face button -> position on the pad; Switch swaps A/B and X/Y relative to Xbox
@@ -85,7 +85,7 @@ face_slots = {
 }
 pad_labels = {
     "sdl": {"title": "Xbox / standard gamepad", "lt": "LT", "rt": "RT", "lb": "LB", "rb": "RB", "back": "Back", "start": "Start"},
-    "switch": {"title": "Nintendo Switch controller", "lt": "ZL", "rt": "ZR", "lb": "L", "rb": "R", "back": "-", "start": "+"},
+    "switch": {"title": "Nintendo Switch controller", "lt": "ZL", "rt": "ZR", "lb": "L", "rb": "R", "back": "Minus", "start": "Plus"},
 }
 raw_mode_buttons = {10, 11}
 controller_mode_buttons = {pygame.CONTROLLER_BUTTON_BACK, pygame.CONTROLLER_BUTTON_START}
@@ -318,55 +318,87 @@ def mapping_html():
         return f"<table class='map'>{rows}</table>"
     labels = pad_labels[controller_layout]
     slots = face_slots[controller_layout]
-    ox = 70  # shifts the pad (drawn around x=380) to the middle of the 900 wide canvas
+    scale, pad_cx, pad_cy = 1.3, 380, 208  # the pad is drawn around (380, 208); scaled up about that point
+    pt = lambda x, y: (round(450 + scale * (x - pad_cx), 1), round(pad_cy + scale * (y - pad_cy), 1))
     desc = action_descriptions
 
-    def callout(cx, cy, tx, ty, anchor, lx, ly, title, text):
-        # leader from a control (pad coordinates) to its text; the title is the printed button name
-        return (
-            f"<line class='leader' x1='{cx + ox}' y1='{cy}' x2='{lx}' y2='{ly}'/>"
-            f"<text x='{tx}' y='{ty}' text-anchor='{anchor}'><tspan class='t'>{title}</tspan>"
-            f"<tspan x='{tx}' dy='16'>{text}</tspan></text>"
+    def desc_lines(text, x, y, anchor):
+        # "|" splits a description into lines
+        return "".join(
+            f"<text class='desc' x='{x}' y='{y + 18 * i}' text-anchor='{anchor}'>{line}</text>"
+            for i, line in enumerate(text.split("|"))
         )
-    left = lambda cx, cy, ty, title, text: callout(cx, cy, 235, ty, "end", 242, ty - 4, title, text)
-    right = lambda cx, cy, ty, title, text: callout(cx, cy, 665, ty, "start", 658, ty - 4, title, text)
-    below = lambda cx, cy, tx, title, text: callout(cx, cy, tx, 340, "middle", tx, 324, title, text)
 
-    face_buttons = "".join(
-        f"<circle class='shape' cx='{490 + dx}' cy='{175 + dy}' r='11'/>"
-        f"<text class='lbl face' x='{490 + dx}' y='{175 + dy}'>{name}</text>"
-        for name, (dx, dy) in (
-            (n, {"north": (0, -24), "east": (24, 0), "south": (0, 24), "west": (-24, 0)}[slot])
-            for n, slot in slots.items()
+    def callout(cx, cy, side, ly, title, text):
+        # title is the printed button name; ly is where the label sits, cx/cy the control in pad coordinates
+        w = max(30, 7.4 * len(title) + 18)
+        left_side = side == "left"
+        edge = 180 if left_side else 720
+        px = edge - w if left_side else edge
+        end, bend = (edge + 4, edge + 34) if left_side else (edge - 4, edge - 34)
+        ax, ay = pt(cx, cy)
+        return (
+            f"<polyline class='leader' points='{ax},{ay} {bend},{ly} {end},{ly}'/>"
+            f"<circle class='dot' cx='{ax}' cy='{ay}' r='3'/>"
+            f"<rect class='pill' x='{px}' y='{ly - 11}' width='{w}' height='22' rx='11'/>"
+            f"<text class='cap' x='{px + w / 2}' y='{ly}' dy='.35em'>{title}</text>"
+            + desc_lines(text, edge, ly + 28, "end" if left_side else "start")
         )
+
+    def below(cx, cy, mx, title, text):
+        w = max(30, 7.4 * len(title) + 18)
+        ax, ay = pt(cx, cy)
+        return (
+            f"<polyline class='leader' points='{ax},{ay + 10} {ax},272 {mx},294'/>"
+            f"<circle class='dot' cx='{ax}' cy='{ay}' r='3'/>"
+            f"<rect class='pill' x='{mx - w / 2}' y='294' width='{w}' height='22' rx='11'/>"
+            f"<text class='cap' x='{mx}' y='305' dy='.35em'>{title}</text>"
+            + desc_lines(text, mx, 333, "middle")
+        )
+
+    face_offsets = {"north": (0, -24), "east": (24, 0), "south": (0, 24), "west": (-24, 0)}
+    face_buttons = "".join(
+        f"<circle class='btn' cx='{490 + face_offsets[slot][0]}' cy='{175 + face_offsets[slot][1]}' r='12'/>"
+        f"<text class='btn-t' x='{490 + face_offsets[slot][0]}' y='{175 + face_offsets[slot][1]}' dy='.35em'>{name}</text>"
+        for name, slot in slots.items()
     )
     face_legend = "".join(
-        f"<tspan x='665' dy='17'><tspan class='t'>{name}</tspan>  {desc[name]}</tspan>"
-        for name in sorted(slots)
+        f"<circle class='btn' cx='732' cy='{204 + 24 * i}' r='9'/>"
+        f"<text class='btn-t' x='732' y='{204 + 24 * i}' dy='.35em'>{name}</text>"
+        f"<text class='desc' x='750' y='{204 + 24 * i}' dy='.35em'>{desc[name]}</text>"
+        for i, name in enumerate(sorted(slots))
     )
     return f"""
-    <div><b>{labels['title']}</b></div>
-    <svg class='mapping' viewBox='0 0 900 370' xmlns='http://www.w3.org/2000/svg'>
-      <g transform='translate({ox},0)'>
-        <path class='shape' d='M 270 120 H 490 C 520 120 540 140 548 180 L 575 290 C 582 322 548 334 528 312 L 470 250 H 290 L 232 312 C 212 334 178 322 185 290 L 212 180 C 220 140 240 120 270 120 Z'/>
-        <rect class='shape' x='245' y='82' width='80' height='20' rx='6'/><text class='lbl' x='285' y='92'>{labels['lt']}</text>
-        <rect class='shape' x='435' y='82' width='80' height='20' rx='6'/><text class='lbl' x='475' y='92'>{labels['rt']}</text>
-        <rect class='shape' x='245' y='106' width='80' height='12' rx='5'/><text class='lbl' x='285' y='112'>{labels['lb']}</text>
-        <rect class='shape' x='435' y='106' width='80' height='12' rx='5'/><text class='lbl' x='475' y='112'>{labels['rb']}</text>
-        <circle class='shape' cx='270' cy='175' r='22'/><circle class='shape' cx='270' cy='175' r='11'/>
-        <rect class='shape' x='309.5' y='207' width='11' height='30'/><rect class='shape' x='300' y='216.5' width='30' height='11'/>
-        <circle class='shape' cx='445' cy='222' r='20'/><circle class='shape' cx='445' cy='222' r='10'/>
-        <circle class='shape' cx='355' cy='170' r='7'/><circle class='shape' cx='405' cy='170' r='7'/>
+    <div class='mapping-title'>{labels['title']}</div>
+    <svg class='mapping' viewBox='47 25 820 353' xmlns='http://www.w3.org/2000/svg'>
+      <defs>
+        <linearGradient id='padbody' x1='0' y1='0' x2='0' y2='1'>
+          <stop offset='0' stop-color='#323232'/><stop offset='1' stop-color='#1f1f1f'/>
+        </linearGradient>
+      </defs>
+      <g transform='translate(450,{pad_cy}) scale({scale}) translate({-pad_cx},{-pad_cy})'>
+        <rect class='ctl on' x='245' y='82' width='80' height='20' rx='8'/><text class='lbl' x='285' y='92' dy='.35em'>{labels['lt']}</text>
+        <rect class='ctl on' x='435' y='82' width='80' height='20' rx='8'/><text class='lbl' x='475' y='92' dy='.35em'>{labels['rt']}</text>
+        <rect class='ctl' x='245' y='106' width='80' height='12' rx='6'/><text class='lbl' x='285' y='112' dy='.35em'>{labels['lb']}</text>
+        <rect class='ctl on' x='435' y='106' width='80' height='12' rx='6'/><text class='lbl' x='475' y='112' dy='.35em'>{labels['rb']}</text>
+        <path class='body' d='M 270 120 H 490 C 520 120 540 140 548 180 L 575 290 C 582 322 548 334 528 312 L 470 250 H 290 L 232 312 C 212 334 178 322 185 290 L 212 180 C 220 140 240 120 270 120 Z'/>
+        <circle class='ctl' cx='380' cy='150' r='8'/>
+        <circle class='ctl on' cx='270' cy='175' r='24'/><circle class='stick' cx='270' cy='175' r='14'/>
+        <path class='ctl on' d='M 309 207 h12 v9.5 h9.5 v12 h-9.5 v9.5 h-12 v-9.5 h-9.5 v-12 h9.5 z'/>
+        <circle class='ctl on' cx='445' cy='222' r='22'/><circle class='stick' cx='445' cy='222' r='13'/>
+        <circle class='ctl on' cx='355' cy='170' r='6'/><circle class='ctl on' cx='405' cy='170' r='6'/>
         {face_buttons}
       </g>
-      {left(245, 92, 40, labels['lt'], 'Recording combo: LT + RT + L3')}
-      {left(248, 175, 170, 'Left stick', 'Walk (press: L3)')}
-      {left(300, 222, 240, 'D-pad', 'Head yaw / pitch')}
-      {right(515, 92, 40, labels['rt'], 'Hold + B: strong kick')}
-      {right(515, 112, 88, labels['rb'], desc['RB'])}
-      <line class='leader' x1='{525 + ox}' y1='175' x2='658' y2='136'/>
-      <text x='665' y='123'><tspan class='t'>Face buttons</tspan>{face_legend}</text>
-      {right(465, 222, 262, 'Right stick', 'Turn')}
+      {callout(245, 92, "left", 57, labels['lt'], f"Recording combo|({labels['lt']} + {labels['rt']} + L3)")}
+      {callout(248, 175, "left", 165, 'Left stick', 'Walk (press: L3)')}
+      {callout(300, 222, "left", 226, 'D-pad', 'Head yaw / pitch')}
+      {callout(515, 92, "right", 57, labels['rt'], 'Strong kick|(hold + B)')}
+      {callout(515, 112, "right", 130, labels['rb'], desc['RB'])}
+      <polyline class='leader' points='640,165 678,240 712,240'/><circle class='dot' cx='640' cy='165' r='3'/>
+      <polyline class='leader' points='716,194 712,194 712,286 716,286'/>
+      <text class='head' x='720' y='184'>FACE BUTTONS</text>
+      {face_legend}
+      {callout(465, 222, "right", 325, 'Right stick', 'Turn')}
       {below(355, 170, 405, labels['back'], desc['Back'])}
       {below(405, 170, 495, labels['start'], desc['Start'])}
     </svg>"""
@@ -833,7 +865,7 @@ def index():
 
     @ui.refreshable
     def mapping_view():
-        ui.html(mapping_html(), sanitize=False)
+        ui.html(mapping_html(), sanitize=False).classes("w-full")
 
     def refresh():
         if controller_status != last.get("controller"):
@@ -920,13 +952,21 @@ def index():
         .nicegui-content { padding: 0.5rem; }
         @media (min-width: 640px) { .nicegui-content { padding: 1rem; } }
 
-        .mapping { width: 100%; min-width: 720px; height: auto; }
-        .mapping .shape { fill: rgba(255,255,255,0.06); stroke: currentColor; stroke-opacity: 0.6; stroke-width: 2; }
-        .mapping .leader { stroke: #FFAE00; stroke-opacity: 0.6; stroke-width: 1; }
-        .mapping text { fill: currentColor; font-size: 13px; }
-        .mapping .t { font-weight: 700; fill: #FFAE00; }
-        .mapping .lbl { font-size: 10px; text-anchor: middle; dominant-baseline: central; opacity: 0.8; }
-        .mapping .face { font-size: 13px; font-weight: 700; opacity: 1; }
+        .mapping-title { font-size: 0.8rem; opacity: 0.7; }
+        .mapping { width: 100%; min-width: 600px; height: auto; display: block; font-family: inherit; }
+        .mapping .body { fill: url(#padbody); stroke: #3f3f3f; stroke-width: 2; }
+        .mapping .ctl { fill: #262626; stroke: #4a4a4a; stroke-width: 1.5; }
+        .mapping .ctl.on { fill: #2b2417; stroke: #FFAE00; }
+        .mapping .stick { fill: #343434; stroke: #5a5a5a; stroke-width: 1.5; }
+        .mapping .btn { fill: #FFAE00; }
+        .mapping .btn-t { fill: #161616; font-size: 14px; font-weight: 700; text-anchor: middle; }
+        .mapping .lbl { fill: #9a9a9a; font-size: 11px; text-anchor: middle; }
+        .mapping .leader { fill: none; stroke: #FFAE00; stroke-opacity: 0.55; stroke-width: 1.2; }
+        .mapping .dot { fill: #FFAE00; }
+        .mapping .pill { fill: rgba(255, 174, 0, 0.14); stroke: #FFAE00; stroke-width: 1.2; }
+        .mapping .cap { fill: #FFAE00; font-size: 13px; font-weight: 600; text-anchor: middle; }
+        .mapping .desc { fill: #dcdcdc; font-size: 14px; }
+        .mapping .head { fill: #9a9a9a; font-size: 12px; letter-spacing: 0.08em; }
         .map td { padding: 0.15rem 0.75rem; }
 
         /* phone portrait + desktop: video on top, sticks in the corners below it */
@@ -966,9 +1006,12 @@ def index():
 
             ip_menu()
 
-            with ui.dialog() as mapping_dialog, ui.card().style("max-width: 95vw !important; width: 920px; overflow-x: auto"):
+            with ui.dialog() as mapping_dialog, ui.card().classes("gap-1").style("max-width: 95vw !important; width: 1000px; overflow-x: auto"):
+                with ui.row().classes("w-full items-center justify-between no-wrap"):
+                    ui.label("Controller mapping").classes("text-lg font-medium")
+                    ui.button(icon="close", on_click=lambda: mapping_dialog.close()).props("flat round dense")
                 mapping_view()
-            ui.button(icon="sports_esports", on_click=mapping_dialog.open).props("flat round dense color=white")
+            ui.button(icon="sports_esports", on_click=mapping_dialog.open).props("flat round dense color=white").tooltip("Controller mapping")
 
             # phone: small fixed-width bar. desktop: stretches to fill the line.
             with ui.row().classes("w-20 items-center no-wrap gap-2 sm:flex-1 sm:w-auto sm:min-w-24"):
