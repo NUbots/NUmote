@@ -45,6 +45,7 @@ max_yaw = 1
 pad = None
 controller = None
 controller_status = "No controller connected"
+controller_layout = "none"  # "none" | "raw" | "sdl" | "switch"
 pad_axes = (0.0, 0.0, 0.0, 0.0)  # lx, ly, rx, ry after dead zone
 deadzone = 0.15
 last_axis_log_at = 0.0
@@ -71,6 +72,16 @@ switch_controller_button_actions = {
     **controller_button_actions,
     pygame.CONTROLLER_BUTTON_Y: ("X", lambda: toggle_wave()),
     pygame.CONTROLLER_BUTTON_X: ("Y", lambda: send_action("get_up")),
+}
+# keyed by printed button name; the Switch dict relabels so a name means the same action on every layout
+action_descriptions = {
+    "A": "Random dance", "B": "Kick (hold RT: strong kick)", "X": "Toggle wave",
+    "Y": "Get up", "RB": "Toggle chase", "Back": "Stand", "Start": "Walk",
+}
+# SDL button -> face position on the mapping diagram
+face_positions = {
+    pygame.CONTROLLER_BUTTON_Y: "north", pygame.CONTROLLER_BUTTON_B: "east",
+    pygame.CONTROLLER_BUTTON_A: "south", pygame.CONTROLLER_BUTTON_X: "west",
 }
 raw_mode_buttons = {10, 11}
 controller_mode_buttons = {pygame.CONTROLLER_BUTTON_BACK, pygame.CONTROLLER_BUTTON_START}
@@ -291,6 +302,34 @@ async def relay_loop(ip):
 def trigger_pressed(value):
     return value > (0.5 if abs(value) <= 1 else 16384)
 
+def mapping_html():
+    """Controller mapping for the connected layout; built only from the constants above."""
+    if controller_layout == "none":
+        return "<p>No controller connected</p>"
+    if controller_layout == "raw":
+        rows = "".join(
+            f"<tr><td>button {i}</td><td>{name}</td><td>{action_descriptions[name]}</td></tr>"
+            for i, (name, _) in button_actions.items()
+        )
+        return f"<table class='map'>{rows}</table>"
+    actions = switch_controller_button_actions if controller_layout == "switch" else controller_button_actions
+    face = {pos: actions[button][0] for button, pos in face_positions.items()}
+    cell = lambda pos: (
+        f"<div class='face {pos}'><b>{face[pos]}</b><span>{action_descriptions[face[pos]]}</span></div>"
+    )
+    return f"""
+    <div class='pad'>
+      <div class='diamond'>{cell('north')}{cell('west')}{cell('east')}{cell('south')}</div>
+      <ul>
+        <li><b>RB</b> {action_descriptions['RB']}</li>
+        <li><b>LT + RT + L3</b> Toggle video recording</li>
+        <li><b>Left stick</b> Walk</li>
+        <li><b>Right stick</b> Turn</li>
+        <li><b>D-pad</b> Head yaw / pitch</li>
+        <li><b>Back / Start</b> {action_descriptions['Back']} / {action_descriptions['Start']}</li>
+      </ul>
+    </div>"""
+
 def shutdown_video_recording():
     global video_recorders, recording_active, recording_stopping
     with recording_lock:
@@ -322,7 +361,7 @@ def start_pad():
 
 def poll_pad():
     """Read the controller through SDL and drive the robot."""
-    global pad, controller, controller_status, pad_axes, buttons_down, last_axis_log_at
+    global pad, controller, controller_status, controller_layout, pad_axes, buttons_down, last_axis_log_at
     global record_combo_stage, left_trigger_was_pressed, right_trigger_was_pressed
     pygame.event.pump()
     if any(event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED) for event in pygame.event.get()):
@@ -334,10 +373,12 @@ def poll_pad():
         pad = None
         controller = None
         controller_status = "No controller connected"
+        controller_layout = "none"
     elif pad is None:
         pad = pygame.joystick.Joystick(0)
         controller = sdl_controller.Controller(0) if sdl_controller.is_controller(0) else None
         is_switch_layout = "nintendo switch" in pad.get_name().lower()
+        controller_layout = "raw" if controller is None else "switch" if is_switch_layout else "sdl"
         mapping_status = (
             "SDL Switch face labels" if controller and is_switch_layout else
             "SDL mapping" if controller else
@@ -749,10 +790,15 @@ def index():
             for address in ip_list:
                 ui.item(address, on_click=lambda a=address: reconnect(a))  # a=address binds this loop's value
 
+    @ui.refreshable
+    def mapping_view():
+        ui.html(mapping_html(), sanitize=False)
+
     def refresh():
         if controller_status != last.get("controller"):
             last["controller"] = controller_status
             controller_display.text = f"Controller: {controller_status}"
+            mapping_view.refresh()
 
         if recording_status != last.get("recording_status"):
             last["recording_status"] = recording_status
@@ -833,6 +879,18 @@ def index():
         .nicegui-content { padding: 0.5rem; }
         @media (min-width: 640px) { .nicegui-content { padding: 1rem; } }
 
+        .pad { display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: center; }
+        .pad ul { list-style: none; margin: 0; padding: 0; }
+        .pad li { padding: 0.15rem 0; }
+        .diamond { display: grid; grid-template: repeat(3, 5.5rem) / repeat(3, 5.5rem); }
+        .diamond .face { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; font-size: 0.75rem; }
+        .diamond .face b { font-size: 1.25rem; color: #FFAE00; }
+        .diamond .north { grid-area: 1 / 2; }
+        .diamond .west { grid-area: 2 / 1; }
+        .diamond .east { grid-area: 2 / 3; }
+        .diamond .south { grid-area: 3 / 2; }
+        .map td { padding: 0.15rem 0.75rem; }
+
         /* phone portrait + desktop: video on top, sticks in the corners below it */
         .stage {
             display: grid; width: 100%; gap: 0.5rem; align-items: center;
@@ -869,7 +927,11 @@ def index():
             ui.image(source="numote.png").props("fit=contain").classes("shrink-0 w-12 h-7 sm:w-24 sm:h-14")  # 517x302 logo
 
             ip_menu()
-            
+
+            with ui.dialog() as mapping_dialog, ui.card():
+                mapping_view()
+            ui.button(icon="sports_esports", on_click=mapping_dialog.open).props("flat round dense color=white")
+
             # phone: small fixed-width bar. desktop: stretches to fill the line.
             with ui.row().classes("w-20 items-center no-wrap gap-2 sm:flex-1 sm:w-auto sm:min-w-24"):
                 ui.label("Battery").classes("max-sm:hidden whitespace-nowrap")
