@@ -9,7 +9,7 @@ import pygame._sdl2.controller as sdl_controller
 from nicegui import app, ui
 from gprc_head import GrpcHead
 from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
-import hashlib, hmac, json, secrets, socket
+import hashlib, hmac, json, posixpath, secrets, shlex, socket
 
 robot_ip = "" # empty for now
 ip_list = [] # this is the list of discovered Robot IPs
@@ -95,6 +95,9 @@ head = None
 record_combo_stage = 0
 left_trigger_was_pressed = False
 right_trigger_was_pressed = False
+
+SCP_LOCATION = "" # place we SCP the bridge to; empty = remote user's home directory
+ROBOT_SSH_USER = os.environ.get("NUMOTE_ROBOT_SSH_USER", "miles")
 
 class VideoRecorder:
     FPS = 30
@@ -691,6 +694,191 @@ def send_strong_kick():
     print("Strong Kick accepted")
     return True
 
+def confirm_bridge_with_robot(robot_ip):
+    """Compare the local bridge's checksum with the robot's copy.
+
+    True: copies match. False: robot's copy differs or is missing, so it needs a transfer.
+    None: couldn't tell (no robot selected, SSH failed, or no sha256sum on the robot).
+    """
+    if not robot_ip:
+        print("Bridge check skipped: no robot selected")
+        return None
+
+    # compute the checksum of the bridge we have on file (presumed to be latest)
+    bridge_path = Path(__file__).with_name("NUmote_bridge.py")
+    with open(bridge_path, "rb") as f:
+        local_checksum = hashlib.file_digest(f, "sha256").hexdigest() # SHA256 seems alright
+
+    remote_path = posixpath.join(SCP_LOCATION, bridge_path.name)
+    command = [
+        "ssh",
+        "-o", "BatchMode=yes",  # no terminal behind the UI, so fail instead of waiting on a password prompt
+        "-o", "ConnectTimeout=5",
+        f"{ROBOT_SSH_USER}@{robot_ip}",
+        f"sha256sum -- {shlex.quote(remote_path)}",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"Bridge check failed: {e}")
+        return None
+
+    # sha256sum exits 1 when it can't read the file; ssh itself exits 255 and a missing command exits 127
+    if result.returncode == 1:
+        print(f"Bridge missing or unreadable on {robot_ip}: {result.stderr.strip()}")
+        return False
+    if result.returncode != 0 or not result.stdout.strip():
+        print(f"Bridge check failed: {result.stderr.strip()}")
+        return None
+
+    remote_checksum = result.stdout.split()[0]
+    if remote_checksum != local_checksum:
+        print(f"Bridge out of date on {robot_ip}: local {local_checksum}, robot {remote_checksum}")
+        return False
+
+    print(f"Bridge up to date on {robot_ip}")
+    return True
+
+def transfer_bridge_to_robot(robot_ip):
+    # assuming the robot needs a new copy of the bridge script, SCP it to them
+    if not robot_ip:
+        print("Bridge transfer skipped: no robot selected")
+        return False
+
+    bridge_path = Path(__file__).with_name("NUmote_bridge.py")
+    command = [
+        "scp",
+        "-o", "BatchMode=yes",  # no terminal behind the UI, so fail instead of waiting on a password prompt
+        "-o", "ConnectTimeout=5",
+        str(bridge_path),
+        f"{ROBOT_SSH_USER}@{robot_ip}:{SCP_LOCATION}",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"Bridge transfer failed: {e}")
+        return False
+
+    if result.returncode != 0:
+        print(f"Bridge transfer failed: {result.stderr.strip()}")
+        return False
+
+    print(f"Bridge transferred to {robot_ip}:{SCP_LOCATION}")
+    return True
+
+def wait_for_bridge_report(listener, nonce, ssh_process, timeout):
+    """Wait for the bridge to connect back with this launch's nonce. Gives up early if the launch script fails."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            conn, _ = listener.accept()
+        except TimeoutError:
+            if ssh_process.poll() not in (None, 0):
+                return False
+            continue
+        with conn:
+            conn.settimeout(2)
+            try:
+                report = conn.recv(256)
+            except OSError:
+                continue
+        if report.strip() == nonce.encode():
+            return True
+    return False
+
+
+def start_bridge_on_robot(robot_ip):
+    """(Re)start the bridge on the robot. Returns True once the bridge reports back that its ports are open."""
+    if not robot_ip:
+        print("Bridge start skipped: no robot selected")
+        return False
+
+    if not STRONG_KICK_TOKEN:
+        print("Bridge starting without NUMOTE_STRONG_KICK_TOKEN: its robot-action relay will be disabled")
+
+    remote_path = shlex.quote(posixpath.join(SCP_LOCATION, "NUmote_bridge.py"))
+    log_path = shlex.quote(posixpath.join(SCP_LOCATION, "NUmote_bridge.log"))
+    report_nonce = secrets.token_hex(16)  # so only this launch's bridge can confirm the start
+    command = [
+        "ssh",
+        "-o", "BatchMode=yes",  # no terminal behind the UI, so fail instead of waiting on a password prompt
+        "-o", "ConnectTimeout=5",
+        f"{ROBOT_SSH_USER}@{robot_ip}",
+        "bash -s",
+    ]
+    try:
+        listener = socket.create_server(("", 0))  # the bridge connects back here once it's up
+    except OSError as e:
+        print(f"Bridge start failed: {e}")
+        return False
+
+    with listener:
+        listener.settimeout(0.5)
+        # The env vars match the robot's own camera process, otherwise no frames arrive.
+        # Sent over stdin so the token never shows up in a process list, and so pkill can't match this shell.
+        # SSH_CONNECTION's first field is this host's address as the robot sees it.
+        script = f"""
+source /opt/ros/humble/setup.bash || exit 1
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp RMW_FASTRTPS_USE_QOS_FROM_XML=0
+export FASTRTPS_DEFAULT_PROFILES_FILE=/opt/booster/config/dds_configs/single-board_configs/fastdds_profile.xml
+export NUMOTE_STRONG_KICK_TOKEN={shlex.quote(STRONG_KICK_TOKEN)}
+export NUMOTE_STRONG_KICK_PORT={STRONG_KICK_PORT}
+export NUMOTE_BRIDGE_REPORT_ADDR="${{SSH_CONNECTION%% *}}:{listener.getsockname()[1]}"
+export NUMOTE_BRIDGE_REPORT_NONCE={report_nonce}
+
+pkill -f 'NUmote_bridge\\.py' && sleep 1  # a running copy would hold the port and may be out of date
+nohup python3 {remote_path} {CAMERA_RELAY_PORT} > {log_path} 2>&1 < /dev/null &
+bridge_pid=$!
+
+# only watches for a crash, so the host doesn't sit out its whole timeout; the bridge's report is what confirms the start
+for _ in $(seq 1 25); do
+    if ! kill -0 "$bridge_pid" 2>/dev/null; then
+        echo "bridge exited during startup:" >&2
+        tail -n 20 {log_path} >&2
+        exit 1
+    fi
+    sleep 1
+done
+"""
+        try:
+            ssh_process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            )
+        except OSError as e:
+            print(f"Bridge start failed: {e}")
+            return False
+
+        try:
+            ssh_process.stdin.write(script)
+            ssh_process.stdin.close()
+        except OSError:
+            pass  # ssh already exited; its exit code and stderr are reported below
+
+        reported = wait_for_bridge_report(listener, report_nonce, ssh_process, timeout=30)
+
+    if reported:
+        ssh_process.kill()  # the bridge is detached, so this only ends the crash watch
+        ssh_process.wait()
+        ssh_process.stderr.close()
+        print(f"Bridge reported running on {robot_ip}:{CAMERA_RELAY_PORT}")
+        return True
+
+    launch_failed = ssh_process.poll() not in (None, 0)
+    if not launch_failed:
+        ssh_process.kill()
+    ssh_process.wait()
+    errors = ssh_process.stderr.read().strip()
+    ssh_process.stderr.close()
+    if launch_failed:
+        print(f"Bridge start failed: {errors}")
+    else:
+        print(
+            f"Bridge start unconfirmed: no report from {robot_ip} within 30s. It may still be running. "
+            "Check that the robot's copy is current, that this machine accepts inbound connections from it, "
+            f"and its log at ~/{posixpath.join(SCP_LOCATION, 'NUmote_bridge.log')}"
+        )
+    return False
+
 
 def send_random_dance():
     response = send_relay_command("dance")
@@ -844,6 +1032,9 @@ def connect(ip):
 # only auto-connect if an IP is hardcoded above; otherwise wait for one to be picked from the menu
 app.on_startup(lambda: robot_ip and connect(robot_ip))
 app.on_startup(lambda: robot_ip and start_sender(robot_ip))
+app.on_startup(lambda: confirm_bridge_with_robot("10.0.1.150"))
+app.on_startup(lambda: transfer_bridge_to_robot("10.0.1.150"))
+app.on_startup(lambda: start_bridge_on_robot("10.0.1.150"))
 app.on_startup(start_discovery)
 app.on_startup(start_pad)
 app.on_shutdown(lambda: head and head.shutdown())

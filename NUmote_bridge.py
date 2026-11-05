@@ -224,6 +224,20 @@ def accept_command_loop(server):
 		threading.Thread(target=serve_command_client, args=(conn, addr), daemon=True).start()
 
 
+def report_started():
+	"""Tell the NUmote host that launched this bridge that its ports are open. No-op when started by hand."""
+	address = os.environ.get("NUMOTE_BRIDGE_REPORT_ADDR")
+	if not address:
+		return
+	host, _, port = address.rpartition(":")
+	try:
+		with socket.create_connection((host, int(port)), timeout=5) as conn:
+			conn.sendall(os.environ.get("NUMOTE_BRIDGE_REPORT_NONCE", "").encode() + b"\n")
+		print(f"reported start to host {host}", flush=True)
+	except (OSError, ValueError) as e:
+		print(f"could not report start to host {address}: {e}", flush=True)
+
+
 def main():
 	rclpy.init()
 	node = rclpy.create_node("numote_camera_relay")
@@ -249,6 +263,7 @@ def main():
 			print(f"strong-kick relay unavailable: {e}", flush=True)
 	else:
 		print("robot-action relay disabled: set NUMOTE_STRONG_KICK_TOKEN", flush=True)
+	threading.Thread(target=report_started, daemon=True).start()  # in a thread so an unreachable host can't delay frames
 	try:
 		rclpy.spin(node)
 	except KeyboardInterrupt:
