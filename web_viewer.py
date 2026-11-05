@@ -78,10 +78,14 @@ action_descriptions = {
     "A": "Random dance", "B": "Kick (hold RT: strong kick)", "X": "Toggle wave",
     "Y": "Get up", "RB": "Toggle chase", "Back": "Stand", "Start": "Walk",
 }
-# SDL button -> face position on the mapping diagram
-face_positions = {
-    pygame.CONTROLLER_BUTTON_Y: "north", pygame.CONTROLLER_BUTTON_B: "east",
-    pygame.CONTROLLER_BUTTON_A: "south", pygame.CONTROLLER_BUTTON_X: "west",
+# printed face button -> position on the pad; Switch swaps A/B and X/Y relative to Xbox
+face_slots = {
+    "sdl": {"Y": "north", "B": "east", "A": "south", "X": "west"},
+    "switch": {"X": "north", "A": "east", "B": "south", "Y": "west"},
+}
+pad_labels = {
+    "sdl": {"title": "Xbox / standard gamepad", "lt": "LT", "rt": "RT", "lb": "LB", "rb": "RB", "back": "Back", "start": "Start"},
+    "switch": {"title": "Nintendo Switch controller", "lt": "ZL", "rt": "ZR", "lb": "L", "rb": "R", "back": "-", "start": "+"},
 }
 raw_mode_buttons = {10, 11}
 controller_mode_buttons = {pygame.CONTROLLER_BUTTON_BACK, pygame.CONTROLLER_BUTTON_START}
@@ -312,23 +316,60 @@ def mapping_html():
             for i, (name, _) in button_actions.items()
         )
         return f"<table class='map'>{rows}</table>"
-    actions = switch_controller_button_actions if controller_layout == "switch" else controller_button_actions
-    face = {pos: actions[button][0] for button, pos in face_positions.items()}
-    cell = lambda pos: (
-        f"<div class='face {pos}'><b>{face[pos]}</b><span>{action_descriptions[face[pos]]}</span></div>"
+    labels = pad_labels[controller_layout]
+    slots = face_slots[controller_layout]
+    ox = 70  # shifts the pad (drawn around x=380) to the middle of the 900 wide canvas
+    desc = action_descriptions
+
+    def callout(cx, cy, tx, ty, anchor, lx, ly, title, text):
+        # leader from a control (pad coordinates) to its text; the title is the printed button name
+        return (
+            f"<line class='leader' x1='{cx + ox}' y1='{cy}' x2='{lx}' y2='{ly}'/>"
+            f"<text x='{tx}' y='{ty}' text-anchor='{anchor}'><tspan class='t'>{title}</tspan>"
+            f"<tspan x='{tx}' dy='16'>{text}</tspan></text>"
+        )
+    left = lambda cx, cy, ty, title, text: callout(cx, cy, 235, ty, "end", 242, ty - 4, title, text)
+    right = lambda cx, cy, ty, title, text: callout(cx, cy, 665, ty, "start", 658, ty - 4, title, text)
+    below = lambda cx, cy, tx, title, text: callout(cx, cy, tx, 340, "middle", tx, 324, title, text)
+
+    face_buttons = "".join(
+        f"<circle class='shape' cx='{490 + dx}' cy='{175 + dy}' r='11'/>"
+        f"<text class='lbl face' x='{490 + dx}' y='{175 + dy}'>{name}</text>"
+        for name, (dx, dy) in (
+            (n, {"north": (0, -24), "east": (24, 0), "south": (0, 24), "west": (-24, 0)}[slot])
+            for n, slot in slots.items()
+        )
+    )
+    face_legend = "".join(
+        f"<tspan x='665' dy='17'><tspan class='t'>{name}</tspan>  {desc[name]}</tspan>"
+        for name in sorted(slots)
     )
     return f"""
-    <div class='pad'>
-      <div class='diamond'>{cell('north')}{cell('west')}{cell('east')}{cell('south')}</div>
-      <ul>
-        <li><b>RB</b> {action_descriptions['RB']}</li>
-        <li><b>LT + RT + L3</b> Toggle video recording</li>
-        <li><b>Left stick</b> Walk</li>
-        <li><b>Right stick</b> Turn</li>
-        <li><b>D-pad</b> Head yaw / pitch</li>
-        <li><b>Back / Start</b> {action_descriptions['Back']} / {action_descriptions['Start']}</li>
-      </ul>
-    </div>"""
+    <div><b>{labels['title']}</b></div>
+    <svg class='mapping' viewBox='0 0 900 370' xmlns='http://www.w3.org/2000/svg'>
+      <g transform='translate({ox},0)'>
+        <path class='shape' d='M 270 120 H 490 C 520 120 540 140 548 180 L 575 290 C 582 322 548 334 528 312 L 470 250 H 290 L 232 312 C 212 334 178 322 185 290 L 212 180 C 220 140 240 120 270 120 Z'/>
+        <rect class='shape' x='245' y='82' width='80' height='20' rx='6'/><text class='lbl' x='285' y='92'>{labels['lt']}</text>
+        <rect class='shape' x='435' y='82' width='80' height='20' rx='6'/><text class='lbl' x='475' y='92'>{labels['rt']}</text>
+        <rect class='shape' x='245' y='106' width='80' height='12' rx='5'/><text class='lbl' x='285' y='112'>{labels['lb']}</text>
+        <rect class='shape' x='435' y='106' width='80' height='12' rx='5'/><text class='lbl' x='475' y='112'>{labels['rb']}</text>
+        <circle class='shape' cx='270' cy='175' r='22'/><circle class='shape' cx='270' cy='175' r='11'/>
+        <rect class='shape' x='309.5' y='207' width='11' height='30'/><rect class='shape' x='300' y='216.5' width='30' height='11'/>
+        <circle class='shape' cx='445' cy='222' r='20'/><circle class='shape' cx='445' cy='222' r='10'/>
+        <circle class='shape' cx='355' cy='170' r='7'/><circle class='shape' cx='405' cy='170' r='7'/>
+        {face_buttons}
+      </g>
+      {left(245, 92, 40, labels['lt'], 'Recording combo: LT + RT + L3')}
+      {left(248, 175, 170, 'Left stick', 'Walk (press: L3)')}
+      {left(300, 222, 240, 'D-pad', 'Head yaw / pitch')}
+      {right(515, 92, 40, labels['rt'], 'Hold + B: strong kick')}
+      {right(515, 112, 88, labels['rb'], desc['RB'])}
+      <line class='leader' x1='{525 + ox}' y1='175' x2='658' y2='136'/>
+      <text x='665' y='123'><tspan class='t'>Face buttons</tspan>{face_legend}</text>
+      {right(465, 222, 262, 'Right stick', 'Turn')}
+      {below(355, 170, 405, labels['back'], desc['Back'])}
+      {below(405, 170, 495, labels['start'], desc['Start'])}
+    </svg>"""
 
 def shutdown_video_recording():
     global video_recorders, recording_active, recording_stopping
@@ -879,16 +920,13 @@ def index():
         .nicegui-content { padding: 0.5rem; }
         @media (min-width: 640px) { .nicegui-content { padding: 1rem; } }
 
-        .pad { display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: center; }
-        .pad ul { list-style: none; margin: 0; padding: 0; }
-        .pad li { padding: 0.15rem 0; }
-        .diamond { display: grid; grid-template: repeat(3, 5.5rem) / repeat(3, 5.5rem); }
-        .diamond .face { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; font-size: 0.75rem; }
-        .diamond .face b { font-size: 1.25rem; color: #FFAE00; }
-        .diamond .north { grid-area: 1 / 2; }
-        .diamond .west { grid-area: 2 / 1; }
-        .diamond .east { grid-area: 2 / 3; }
-        .diamond .south { grid-area: 3 / 2; }
+        .mapping { width: 100%; min-width: 720px; height: auto; }
+        .mapping .shape { fill: rgba(255,255,255,0.06); stroke: currentColor; stroke-opacity: 0.6; stroke-width: 2; }
+        .mapping .leader { stroke: #FFAE00; stroke-opacity: 0.6; stroke-width: 1; }
+        .mapping text { fill: currentColor; font-size: 13px; }
+        .mapping .t { font-weight: 700; fill: #FFAE00; }
+        .mapping .lbl { font-size: 10px; text-anchor: middle; dominant-baseline: central; opacity: 0.8; }
+        .mapping .face { font-size: 13px; font-weight: 700; opacity: 1; }
         .map td { padding: 0.15rem 0.75rem; }
 
         /* phone portrait + desktop: video on top, sticks in the corners below it */
@@ -928,7 +966,7 @@ def index():
 
             ip_menu()
 
-            with ui.dialog() as mapping_dialog, ui.card():
+            with ui.dialog() as mapping_dialog, ui.card().style("max-width: 95vw !important; width: 920px; overflow-x: auto"):
                 mapping_view()
             ui.button(icon="sports_esports", on_click=mapping_dialog.open).props("flat round dense color=white")
 
