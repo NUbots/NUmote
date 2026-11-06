@@ -2,6 +2,8 @@
 
 A browser remote for Booster K1 robots: live cameras, driving from on-screen sticks or a gamepad, robot actions and video recording.
 
+![NUmote viewer](viewer_screenshot.png)
+
 ## Requirements
 
 - Python 3.11 or newer
