@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NUmote VR</title>
+<style>
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding: 16px;
+    box-sizing: border-box;
+    background: #121212;
+    color: #eee;
+    font-family: system-ui, sans-serif;
+    text-align: center;
+  }
+  h1 { margin: 0; font-size: 1.5rem; }
+  p { margin: 0; max-width: 32rem; color: #aaa; }
+  button {
+    padding: 12px 24px;
+    border: 0;
+    border-radius: 4px;
+    background: #FFAE00;
+    color: #000;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { background: #444; color: #888; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<h1>NUmote VR</h1>
+<button id="enter" disabled>Enter VR</button>
+<p id="status">Checking for WebXR support…</p>
+
+<script>
+// Placeholder WebXR session: a spinning cube in front of the user, which is
+// enough to confirm the session starts and head tracking works. Uses raw WebGL
+// with no external libraries, since the robot network may have no internet.
+const enterButton = document.getElementById("enter");
+const statusText = document.getElementById("status");
+
+const VERTEX_SHADER = `
+  attribute vec3 position;
+  uniform mat4 projection, view;
+  uniform vec3 offset;
+  uniform float angle;
+  varying vec3 color;
+  void main() {
+    float c = cos(angle), s = sin(angle);
+    vec3 p = vec3(c * position.x + s * position.z, position.y, c * position.z - s * position.x);
+    gl_Position = projection * view * vec4(p + offset, 1.0);
+    color = position / 0.3 + 0.5;
+  }`;
+
+const FRAGMENT_SHADER = `
+  precision mediump float;
+  varying vec3 color;
+  void main() { gl_FragColor = vec4(color, 1.0); }`;
+
+function compileShader(gl, type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
+  return shader;
+}
+
+function createCube(gl) {
+  const program = gl.createProgram();
+  gl.attachShader(program, compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
+  gl.attachShader(program, compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+  gl.useProgram(program);
+
+  // 8 corners of a 30cm cube, indexed by the bits of i
+  const corners = [];
+  for (let i = 0; i < 8; i++) corners.push(i & 1 ? 0.15 : -0.15, i & 2 ? 0.15 : -0.15, i & 4 ? 0.15 : -0.15);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(corners), gl.STATIC_DRAW);
+  const position = gl.getAttribLocation(program, "position");
+  gl.enableVertexAttribArray(position);
+  gl.vertexAttribPointer(position, 3, gl.FLOAT, false, 0, 0);
+
+  const faces = [0,1,3,0,3,2, 4,5,7,4,7,6, 0,1,5,0,5,4, 2,3,7,2,7,6, 0,2,6,0,6,4, 1,3,7,1,7,5];
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(faces), gl.STATIC_DRAW);
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0.07, 0.07, 0.07, 1);
+
+  const uniform = (name) => gl.getUniformLocation(program, name);
+  return {
+    count: faces.length,
+    projection: uniform("projection"),
+    view: uniform("view"),
+    offset: uniform("offset"),
+    angle: uniform("angle"),
+  };
+}
+
+let gl = null;
+let cube = null;
+
+async function startSession() {
+  enterButton.disabled = true;
+  try {
+    const session = await navigator.xr.requestSession("immersive-vr", { optionalFeatures: ["local-floor"] });
+    session.addEventListener("end", () => {
+      enterButton.disabled = false;
+      statusText.textContent = "VR session ended.";
+    });
+
+    if (!gl) {
+      gl = document.createElement("canvas").getContext("webgl", { xrCompatible: true });
+      cube = createCube(gl);
+    }
+    session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+
+    // local-floor has y=0 on the floor; plain local has y=0 at the starting head height
+    let space, cubeHeight;
+    try {
+      space = await session.requestReferenceSpace("local-floor");
+      cubeHeight = 1.4;
+    } catch {
+      space = await session.requestReferenceSpace("local");
+      cubeHeight = 0;
+    }
+
+    const onFrame = (time, frame) => {
+      session.requestAnimationFrame(onFrame);
+      const pose = frame.getViewerPose(space);
+      if (!pose) return;
+
+      const layer = session.renderState.baseLayer;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.uniform3f(cube.offset, 0, cubeHeight, -1);
+      gl.uniform1f(cube.angle, time / 1000);
+
+      for (const view of pose.views) {
+        const viewport = layer.getViewport(view);
+        gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+        gl.uniformMatrix4fv(cube.projection, false, view.projectionMatrix);
+        gl.uniformMatrix4fv(cube.view, false, view.transform.inverse.matrix);
+        gl.drawElements(gl.TRIANGLES, cube.count, gl.UNSIGNED_SHORT, 0);
+      }
+    };
+    session.requestAnimationFrame(onFrame);
+    statusText.textContent = "VR session running.";
+  } catch (error) {
+    enterButton.disabled = false;
+    statusText.textContent = `Could not start VR: ${error.message}`;
+  }
+}
+
+let ready = false;
+let supportTimer = null;
+
+async function checkSupport() {
+  try {
+    // Read navigator.xr fresh each time: emulators such as IWE replace it a while after page load
+    const supported = navigator.xr && await navigator.xr.isSessionSupported("immersive-vr");
+    if (ready) return;  // an older, slower check finished after a newer one succeeded
+    if (supported) {
+      ready = true;
+      clearInterval(supportTimer);
+      enterButton.disabled = false;
+      statusText.textContent = "Ready.";
+    } else {
+      statusText.textContent = navigator.xr
+        ? "No VR headset available in this browser. Still checking…"
+        : "This browser does not support WebXR. Still checking…";
+    }
+  } catch (error) {
+    if (!ready) statusText.textContent = `Could not check for VR support: ${error.message}`;
+  }
+}
+
+// Browsers hide navigator.xr on plain http unless the host is localhost
+if (window.isSecureContext) {
+  enterButton.addEventListener("click", startSession);
+  // On a timer rather than chained, so a check that never resolves can't stop later ones
+  supportTimer = setInterval(checkSupport, 1000);
+  checkSupport();
+} else {
+  statusText.textContent = "WebXR needs a secure connection. Open this page over HTTPS or via localhost.";
+}
+</script>
+</body>
+</html>

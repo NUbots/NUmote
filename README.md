@@ -8,7 +8,13 @@
 
 `python3 web_viewer.py`
 
+Then open `https://localhost:8080`. The app serves HTTPS only, using a self-signed certificate generated into `certs/` on first run (this requires `openssl`), so your browser will show a security warning that you need to click through.
+
 Note: Ensure that you are on the epsilon-x wifi network otherwise you will not be able to see the available robots.
+
+## VR
+
+On a headset on the same network, open `https://<laptop-ip>:8080/vr` and click through the security warning. WebXR is only available over HTTPS or on localhost.
 
 ## Controller kicks
 

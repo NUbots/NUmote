@@ -6,6 +6,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")  # no SDL window, so no focus
 import pygame
 import pygame._sdl2.controller as sdl_controller
+from fastapi.responses import FileResponse
 from nicegui import app, ui
 from gprc_head import GrpcHead
 from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
@@ -1305,4 +1306,27 @@ def index():
 
     ui.timer(1 / 30, refresh)
 
-ui.run(port=int(os.environ.get("NUMOTE_WEB_PORT", "8080")), dark=True, title="NUmote", favicon="fav.png")
+# a plain route rather than a ui.page: closing a NiceGUI client fires app.on_disconnect,
+# which would stop the robot while the main page is still driving it
+@app.get("/vr")
+def vr():
+    return FileResponse(Path(__file__).parent / "vr.html")
+
+def ensure_self_signed_cert():
+    """Return (cert, key) paths, generating them on first run. WebXR needs HTTPS off localhost."""
+    cert_dir = Path(__file__).parent / "certs"
+    cert, key = cert_dir / "numote.crt", cert_dir / "numote.key"
+    if not (cert.exists() and key.exists()):
+        cert_dir.mkdir(exist_ok=True)
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", str(key), "-out", str(cert), "-days", "3650", "-subj", "/CN=NUmote",
+             "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+            check=True, capture_output=True,
+        )
+        key.chmod(0o600)
+    return str(cert), str(key)
+
+ssl_certfile, ssl_keyfile = ensure_self_signed_cert()
+ui.run(port=int(os.environ.get("NUMOTE_WEB_PORT", "8080")), dark=True, title="NUmote", favicon="fav.png",
+       ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile)
