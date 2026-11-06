@@ -3,3 +3,5 @@ websockets
 grpcio
 pygame-ce
 booster_robotics_sdk_python
+opencv-python-headless
+numpy

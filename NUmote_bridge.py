@@ -5,10 +5,12 @@ Runs ON the robot: streams the left and right head cameras to NUmote over TCP.
 The phone-app video stream (port 51111) only carries one camera, and DDS doesn't reach the
 laptop, so this subscribes to both ROS 2 camera topics locally and forwards them as JPEGs.
 
-Wire format, repeated per frame:  <u8 camera index (0 = left, 1 = right)> <u32 LE length> <JPEG>
+Wire format, repeated per message:  <u8 stream id> <u32 LE length> <payload>
+Stream ids: 0 = left camera JPEG, 1 = right camera JPEG, 2 = raw 16-bit depth PNG, 3 = detections JSON.
 
 Run on the robot (the env vars match the robot's own camera process, otherwise no frames arrive):
 	source /opt/ros/humble/setup.bash
+	source <soccer agent dir>/vision_interface/share/vision_interface/local_setup.bash  # message type for the detections
 	export RMW_IMPLEMENTATION=rmw_fastrtps_cpp RMW_FASTRTPS_USE_QOS_FROM_XML=0 \
 		FASTRTPS_DEFAULT_PROFILES_FILE=/opt/booster/config/dds_configs/single-board_configs/fastdds_profile.xml
 	export NUMOTE_STRONG_KICK_TOKEN='<same-long-random-value-configured-on-the-laptop>'
@@ -32,10 +34,15 @@ import numpy as np
 import rclpy
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
+from vision_interface.msg import Detections
 
-TOPICS = ("/boostercamera/head/rgb", "/boostercamera/head/right/rgb")  # index = camera id
+TOPICS = ("/boostercamera/head/rgb", "/boostercamera/head/right/rgb")  # index = camera id = stream id
+DEPTH_TOPIC = "/boostercamera/head/depth"
+DETECTIONS_TOPIC = "/booster_vision/detection"
+DEPTH_STREAM = len(TOPICS)
+DETECTIONS_STREAM = DEPTH_STREAM + 1
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 51120
-QUALITY = int(sys.argv[2]) if len(sys.argv) > 2 else 80
+QUALITY = int(sys.argv[2]) if len(sys.argv) > 2 else 98
 STRONG_KICK_PORT = int(os.environ.get("NUMOTE_STRONG_KICK_PORT", "51121"))
 STRONG_KICK_TOKEN = os.environ.get("NUMOTE_STRONG_KICK_TOKEN", "")
 SDK_DOMAIN_ID = int(os.environ.get("NUMOTE_BOOSTER_SDK_DOMAIN_ID", "0"))
@@ -51,7 +58,7 @@ K1_DANCE_CHOICES = (
 	("Michael Dance 1 + 2", "kMichaelDance1And2"),
 )
 
-latest = [None] * len(TOPICS)  # (sequence, packet) per camera
+latest = [None] * (DETECTIONS_STREAM + 1)  # (sequence, packet) per stream
 seq = 0
 cond = threading.Condition()
 clients = 0
@@ -71,29 +78,57 @@ def to_bgr(msg):
 	return cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if msg.encoding == "rgb8" else img
 
 
-def on_image(cam):
+def on_depth(msg):
+	if not clients:
+		return
+	try:
+		if msg.encoding != "mono16":
+			raise ValueError(f"unsupported depth encoding {msg.encoding}")
+		depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.step // 2)[:, :msg.width]
+		ok, png = cv2.imencode(".png", np.ascontiguousarray(depth), [cv2.IMWRITE_PNG_COMPRESSION, 1])  # lossless; low level to spare the robot's CPU
+	except Exception as e:
+		print(f"depth: can't encode {msg.encoding} {msg.width}x{msg.height}: {e}", flush=True)
+		return
+	if ok:
+		publish(DEPTH_STREAM, png.tobytes())
+
+
+def publish(stream, payload):
+	global seq
+	packet = struct.pack("<BI", stream, len(payload)) + payload
+	with cond:
+		seq += 1
+		latest[stream] = (seq, packet)
+		cond.notify_all()
+
+
+def on_image(stream, to_bgr_image):
 	def callback(msg):
-		global seq
 		if not clients:  # don't spend CPU encoding when nobody is watching
 			return
 		try:
-			ok, jpeg = cv2.imencode(".jpg", to_bgr(msg), [cv2.IMWRITE_JPEG_QUALITY, QUALITY])
+			ok, jpeg = cv2.imencode(".jpg", to_bgr_image(msg), [cv2.IMWRITE_JPEG_QUALITY, QUALITY])
 		except Exception as e:
-			print(f"camera {cam}: can't encode {msg.encoding} {msg.width}x{msg.height}: {e}", flush=True)
+			print(f"stream {stream}: can't encode {msg.encoding} {msg.width}x{msg.height}: {e}", flush=True)
 			return
-		if not ok:
-			return
-		packet = struct.pack("<BI", cam, len(jpeg)) + jpeg.tobytes()
-		with cond:
-			seq += 1
-			latest[cam] = (seq, packet)
-			cond.notify_all()
+		if ok:
+			publish(stream, jpeg.tobytes())
 	return callback
+
+
+def on_detections(msg):
+	if not clients:
+		return
+	objects = [
+		{"label": o.label, "confidence": o.confidence, "box": [o.xmin, o.ymin, o.xmax, o.ymax]}
+		for o in msg.detected_objects
+	]
+	publish(DETECTIONS_STREAM, json.dumps(objects, separators=(",", ":")).encode())
 
 
 def serve_client(conn, addr):
 	global clients
-	sent = [0] * len(TOPICS)
+	sent = [0] * len(latest)
 	with cond:
 		clients += 1
 	print(f"client {addr[0]} connected", flush=True)
@@ -241,15 +276,17 @@ def report_started():
 def main():
 	rclpy.init()
 	node = rclpy.create_node("numote_camera_relay")
-	for cam, topic in enumerate(TOPICS):
-		node.create_subscription(Image, topic, on_image(cam), qos_profile_sensor_data)
+	for stream, topic in enumerate(TOPICS):
+		node.create_subscription(Image, topic, on_image(stream, to_bgr), qos_profile_sensor_data)
+	node.create_subscription(Image, DEPTH_TOPIC, on_depth, qos_profile_sensor_data)
+	node.create_subscription(Detections, DETECTIONS_TOPIC, on_detections, 10)
 
 	server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 	server.bind(("0.0.0.0", PORT))
 	server.listen()
 	threading.Thread(target=accept_loop, args=(server,), daemon=True).start()
-	print(f"camera relay on port {PORT}: {', '.join(TOPICS)}", flush=True)
+	print(f"camera relay on port {PORT}: {', '.join((*TOPICS, DEPTH_TOPIC, DETECTIONS_TOPIC))}", flush=True)
 	if STRONG_KICK_TOKEN:
 		kick_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 		kick_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
