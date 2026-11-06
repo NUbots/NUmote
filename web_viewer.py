@@ -35,6 +35,7 @@ VISION_INTERFACE_SETUP = os.environ.get(
     "/opt/booster/booster_agent_data/data/agents/extract/com.boosterobotics.soccer/agent/vision_interface/share/vision_interface/local_setup.bash",
 )  # robot path; provides the message type the bridge needs for detections
 relay_frame_at = 0.0  # monotonic time of the last relay frame
+bridge_status = ""  # progress of the SSH deploy and start, shown in the header
 
 state = {
     "jpeg": {cam: None for cam in CAMERAS},
@@ -42,10 +43,11 @@ state = {
     "depth": None, "depth_count": 0,  # raw 16-bit depth PNG
     "depth_view": None, "depth_view_count": -1,  # its colormapped JPEG, made on demand
     "detections": [], "detections_count": 0,  # [{label, confidence, box: [xmin, ymin, xmax, ymax]}]
-    "battery": 0, "waving": False, "chasing": False, "walking": False,
+    "battery": None, "waving": False, "chasing": False, "walking": False,
 }
 recording_status = "Not recording"
 recording_active = False
+recording_started_at = 0.0  # monotonic time the current recording began
 recording_stopping = False
 recording_lock = threading.Lock()
 video_recorders = {}  # "left" | "right" | "detections" -> VideoRecorder, "depth" -> DepthRecorder, "detections_log" -> DetectionLog
@@ -287,7 +289,7 @@ def stop_recorders(recorders):
     return saved, errors
 
 def toggle_video_recording():
-    global video_recorders, recording_status, recording_active, recording_stopping
+    global video_recorders, recording_status, recording_active, recording_started_at, recording_stopping
     with recording_lock:
         if recording_stopping:
             return
@@ -313,6 +315,7 @@ def toggle_video_recording():
                 print(recording_status)
                 return
             video_recorders = recorders
+            recording_started_at = time.monotonic()
             recording_active = True
             recording_status = f"Recording to {output_dir.name}/: " + ", ".join(r.path.name for r in recorders.values())
             print(recording_status)
@@ -372,6 +375,31 @@ def on_frame(cam, jpeg):
 
 def relay_active():
     return time.monotonic() - relay_frame_at < 2.0
+
+def connection_summary():
+    """(Quasar colour, text) for the header status line."""
+    if not robot_ip:
+        return "grey-6", "No robot selected"
+    if relay_active():
+        return "green-5", f"{robot_ip}: bridge running"
+    status = bridge_status or "waiting"
+    colour = "red-5" if status.startswith("Bridge failed") else "amber-5"
+    stream = "video only" if state["jpeg"][CAMERAS[0]] else "no video yet"
+    return colour, f"{robot_ip}: {stream} - {status}"
+
+BUBBLES = {  # connection_summary colour -> (icon, style); the colours match the notification toasts
+    "grey-6": ("videocam_off", "background: #323232; color: #fff"),
+    "amber-5": ("hourglass_top", "background: #f2c037; color: #000"),
+    "red-5": ("error", "background: #c10015; color: #fff"),
+}
+
+def controller_icon_props():
+    connected = controller_layout != "none"
+    return f"icon={'sports_esports' if connected else 'videogame_asset_off'} color={'green-5' if connected else 'grey-7'}"
+
+def set_speed_limit(percent):
+    global max_mag, max_yaw
+    max_mag = max_yaw = percent / 100
 
 def clear_frames(cameras):
     for cam in cameras:
@@ -752,7 +780,7 @@ def _recv_exact(sock, size):
 
 def _send_robot_request(msg, label):
     if not robot_ip:
-        ui.notify("No robot selected")
+        print("No robot selected")  # also runs on worker threads, where ui.notify has no client
         return False
 
     started_at = time.perf_counter()
@@ -1024,22 +1052,35 @@ done
         )
     return False
 
+def set_bridge_status(ip, text):
+    global bridge_status
+    if ip == robot_ip:  # a slower attempt for a previous robot must not overwrite the current status
+        bridge_status = text
+
 def start_bridged_mode(robot_ip):
     # regular mode will work on the usual robot <-> app comms
     # bridged mode gives you more features, but relies on a bridge script running on board the robot.
 
     # returns True once the bridge is running; if not, regular mode is all that's available.
 
+    set_bridge_status(robot_ip, "Checking bridge...")
     bridge_current = confirm_bridge_with_robot(robot_ip)
     if bridge_current is None:  # couldn't reach the robot or read its checksum, so don't touch its copy
         print("Bridged mode unavailable: could not check the robot's bridge")
+        set_bridge_status(robot_ip, "Bridge failed: couldn't check the robot's copy")
         return False
 
-    if not bridge_current and not transfer_bridge_to_robot(robot_ip):
-        print("Bridged mode unavailable: could not update the robot's bridge")
-        return False
+    if not bridge_current:
+        set_bridge_status(robot_ip, "Copying bridge...")
+        if not transfer_bridge_to_robot(robot_ip):
+            print("Bridged mode unavailable: could not update the robot's bridge")
+            set_bridge_status(robot_ip, "Bridge failed: couldn't copy it to the robot")
+            return False
 
-    return start_bridge_on_robot(robot_ip)
+    set_bridge_status(robot_ip, "Starting bridge...")
+    started = start_bridge_on_robot(robot_ip)
+    set_bridge_status(robot_ip, "Bridge running" if started else "Bridge failed: start not confirmed (see console)")
+    return started
 
 
 bridge_start_lock = threading.Lock()
@@ -1066,6 +1107,19 @@ async def random_dance_from_ui():
         ui.notify(f"Playing {dance_name}")
     else:
         ui.notify("Dance request failed", type="negative")
+
+async def run_robot_action(label, action, *args):
+    """Run a blocking robot request off the event loop and report the outcome."""
+    try:
+        succeeded = await asyncio.to_thread(action, *args)
+    except Exception as e:
+        print(f"{label} failed: {e}")
+        ui.notify(f"{label} failed: {e}", type="negative")
+        return
+    if succeeded:
+        ui.notify(f"{label} sent", type="positive", timeout=1500)
+    else:
+        ui.notify(f"{label} was rejected", type="negative")
 
 def send_soccer_kick():
     try:
@@ -1100,8 +1154,10 @@ def toggle_robot_mode():
 def toggle_wave():
     # "state" is the toggle's current position, like the official app's switch:
     # 0 (currently off) starts the wave, 1 (currently on) stops it
-    if send_action("wave", 1 if state["waving"] else 0):
+    succeeded = send_action("wave", 1 if state["waving"] else 0)
+    if succeeded:
         state["waving"] = not state["waving"]  # only flip once the robot has the command
+    return succeeded
 
 def start_agent(agent: str):
     """Switch the robot to another agent. Returns the robot's reply, e.g. {"result":{"just_started":true},"success":true}."""
@@ -1201,11 +1257,12 @@ def connect(ip):
     for task in (ws_task, relay_task):
         if task:
             task.cancel()
-    state.update(battery=0, waving=False, chasing=False, walking=False)
+    state.update(battery=None, waving=False, chasing=False, walking=False)
     clear_frames(CAMERAS)
     clear_relay_streams()
     ws_task = asyncio.create_task(ws_loop(f"ws://{ip}:{video_stream_port}/"))
     relay_task = asyncio.create_task(relay_loop(ip))
+    set_bridge_status(ip, "Checking bridge...")
     threading.Thread(target=start_bridged_mode_for_connection, args=(ip,), daemon=True).start()
 
 # only auto-connect if an IP is hardcoded above; otherwise wait for one to be picked from the menu
@@ -1226,7 +1283,7 @@ def index():
     @ui.refreshable
     def ip_menu():
         # rebuilt by refresh() whenever discovery finds a new robot
-        with ui.dropdown_button('IP Address: ', color="#FFAE00").props("dense").classes("px-2 text-xs sm:px-3 sm:text-sm"):
+        with ui.dropdown_button(robot_ip or 'IP Address', color="#FFAE00").props("dense").classes("px-2 text-xs sm:px-3 sm:text-sm"):
             for address in ip_list:
                 ui.item(address, on_click=lambda a=address: reconnect(a))  # a=address binds this loop's value
 
@@ -1242,21 +1299,29 @@ def index():
         if controller_status != last.get("controller"):
             last["controller"] = controller_status
             controller_tooltip.text = f"{controller_status} (click for mapping)"
-            controller_button.props(f"color={'green-5' if controller_layout != 'none' else 'grey-7'}")
+            controller_button.props(controller_icon_props())
 
         if recording_status != last.get("recording_status"):
             last["recording_status"] = recording_status
             recording_display.text = recording_status
         if recording_active != last.get("recording_active"):
             last["recording_active"] = recording_active
-            recording_button.text = "STOP REC" if recording_active else "RECORD"
             if recording_active:
                 rec_light.classes(add="rec-on")
             else:
                 rec_light.classes(remove="rec-on")
+        if recording_active:
+            elapsed = int(time.monotonic() - recording_started_at)
+            record_text = f"STOP {elapsed // 60:02d}:{elapsed % 60:02d}"
+        else:
+            record_text = "RECORD"
+        if record_text != last.get("record_text"):
+            last["record_text"] = record_text
+            recording_button.text = record_text
 
-        if len(ip_list) != last["ips"]:  # ip_list only ever grows
+        if len(ip_list) != last["ips"] or robot_ip != last["ip"]:  # ip_list only ever grows
             last["ips"] = len(ip_list)
+            last["ip"] = robot_ip
             ip_menu.refresh()
 
         if state["waving"] != last.get("waving"):  # global, so every open page shows the same
@@ -1296,14 +1361,48 @@ def index():
             imgs[CAMERAS[0]].content = detections_svg(state["detections"]) if det_key[0] else ""
         apply_video_layout()
 
+        conn = connection_summary()
+        if conn != last.get("conn"):
+            last["conn"] = conn
+            connection_dot.props(f"color={conn[0]}")
+            connection_display.text = conn[1]
+
+        ready = bool(robot_ip)
+        if ready != last.get("ready"):
+            last["ready"] = ready
+            for control in robot_controls:
+                control.set_enabled(ready)
+        can_record = recording_active or any(state["jpeg"].values())
+        if can_record != last.get("can_record"):
+            last["can_record"] = can_record
+            recording_button.set_enabled(can_record)
+
+        left_shown = depth_view_jpeg() if view["mode"] == "DEPTH" else state["jpeg"][CAMERAS[0]]
+        if left_shown:
+            bubble = ("", "")
+        elif view["mode"] == "DEPTH" and state["jpeg"][CAMERAS[0]]:
+            bubble = ("No depth data - the bridge must be running", "amber-5")
+        else:
+            bubble = (conn[1], conn[0])
+        if bubble != last.get("bubble"):
+            last["bubble"] = bubble
+            no_video_bubble.set_visibility(bool(bubble[0]))
+            if bubble[0]:
+                icon, style = BUBBLES.get(bubble[1], BUBBLES["grey-6"])
+                no_video_label.text = bubble[0]
+                reason_icon.props(f"name={icon}")
+                reason_bubble.style(replace=style)
+
         # decode some battery stuff and update the battery label
         b = state["battery"]
-        if b != last.get("b"):
+        if b != last.get("b", "unset"):
             last["b"] = b
-            battery_display.value = b / 100
-            battery_label.text = f"{b:.0f}%"
+            battery_display.value = 0 if b is None else b / 100
+            battery_label.text = "--" if b is None else f"{b:.0f}%"
 
-            if b > 80: # your battery is fine :)
+            if b is None:  # no robot or no status message yet
+                battery_display.style('color: #6b6b6b')
+            elif b > 80: # your battery is fine :)
                 battery_display.style('color: #38c25d')
             elif b >= 30: # a lil drained
                 battery_display.style('color: #cfa923')
@@ -1322,6 +1421,8 @@ def index():
 
     async def toggle_recording_from_ui():
         await asyncio.to_thread(toggle_video_recording)
+        failed = "failed" in recording_status or recording_status.startswith("No video")
+        ui.notify(recording_status, type="negative" if failed else "positive")
 
     def apply_video_layout():
         # the second view stays hidden until it has frames; depth and detections are left camera only
@@ -1350,6 +1451,12 @@ def index():
         .rec-light.rec-on { background: #c91c1c; border-color: #c91c1c; animation: rec-blink 1s steps(1) infinite; }
         @keyframes rec-blink { 50% { background: transparent; } }
 
+        .panel { background: #1a1a1a; border: 1px solid #2e2e2e; border-radius: 14px; }
+        .header { padding: 0.5rem 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; }
+        .video.panel { padding: 0.5rem; }
+        .reason-bubble { max-width: 90%; }
+        .page { max-width: 2200px; }
+
         .mapping-title { font-size: 0.8rem; opacity: 0.7; }
         .mapping { width: 100%; min-width: 600px; height: auto; display: block; font-family: inherit; }
         .mapping .body { fill: url(#padbody); stroke: #3f3f3f; stroke-width: 2; }
@@ -1374,7 +1481,8 @@ def index():
             grid-template-columns: 1fr 1fr;
         }
         .stage .video { grid-area: video; }
-        .stage .video, .stage .video :is(img, svg) { max-height: 65dvh; object-fit: contain; }
+        .stage .video .frames, .stage .video :is(img, svg) { max-height: 65dvh; object-fit: contain; }
+        .stage .video .frames { overflow: hidden; }
         .stage .stick-left { grid-area: left; justify-self: start; padding-left: 40%; }
         .stage .stick-right { grid-area: right; justify-self: end; padding-right: 40%; }
         .stage .stick-left, .stage .stick-right { background-color: transparent; }
@@ -1382,71 +1490,93 @@ def index():
         /* phone landscape: gamepad layout, sticks either side of the video */
         @media (orientation: landscape) and (max-height: 500px) {
             .stage { grid-template-areas: "left video right"; grid-template-columns: auto 1fr auto; }
-            .stage .video, .stage .video :is(img, svg) { max-height: calc(100dvh - 7rem); }
+            .stage .video .frames, .stage .video :is(img, svg) { max-height: calc(100dvh - 11rem); }
         }
 
-        /* desktop: video at 80% of the window, sticks overlaid on its bottom corners */
+        /* desktop: video fills the window width, sticks overlaid on its bottom corners */
         @media (min-width: 1024px) and (min-height: 501px) {
-            .stage { width: 80vw; grid-template-areas: "video"; grid-template-columns: 1fr; }
-            .stage .video, .stage .video :is(img, svg) { max-height: calc(100dvh - 7rem); }
+            .stage { grid-template-areas: "video"; grid-template-columns: 1fr; }
+            .stage .video .frames, .stage .video :is(img, svg) { max-height: calc(100dvh - 13.5rem); }
             .stage .stick-left, .stage .stick-right {
                 grid-area: video; align-self: end; z-index: 1;
                 width: 200px; height: 200px; padding: 0; margin: 1.5rem;
             }
-            .header { width: 80vw; }
+        }
+
+        /* wide desktop: the header collapses to one row to leave the picture more height */
+        @media (min-width: 1280px) {
+            .header { flex-direction: row; align-items: center; gap: 1rem; }
+        }
+        @media (min-width: 1280px) and (min-height: 501px) {
+            .stage .video .frames, .stage .video :is(img, svg) { max-height: calc(100dvh - 11.5rem); }
         }
     """)
 
-    with ui.column().classes("w-full max-w-5xl lg:max-w-none items-center mx-auto gap-2 sm:gap-4"):
-        # phone: compact logo + IP + battery on one line, action buttons underneath. desktop: all on one line.
-        with ui.row().classes("header w-full items-center gap-x-2 gap-y-1 sm:gap-x-4"):
-            ui.image(source="numote.png").props("fit=contain").classes("shrink-0 w-12 h-7 sm:w-24 sm:h-14")  # 517x302 logo
+    with ui.column().classes("page w-full items-stretch mx-auto gap-2 sm:gap-3"):
+        with ui.element("div").classes("panel header"):
+            # phone: the status chip drops to its own line. desktop: one row, chip fills the middle.
+            with ui.row().classes("xl:contents w-full items-center gap-x-2 gap-y-1 sm:gap-x-4"):
+                ui.image(source="numote.png").props("fit=contain").classes("shrink-0 w-12 h-7 sm:w-20 sm:h-12")  # 517x302 logo
 
-            ip_menu()
+                ip_menu()
 
-            with ui.dialog() as mapping_dialog, ui.card().classes("gap-1").style("max-width: 95vw !important; width: 1000px; overflow-x: auto"):
-                with ui.row().classes("w-full items-center justify-between no-wrap"):
-                    ui.label("Controller mapping").classes("text-lg font-medium")
-                    ui.button(icon="close", on_click=lambda: mapping_dialog.close()).props("flat round dense")
-                mapping_view()
-            controller_button = ui.button(icon="sports_esports", on_click=open_mapping).props(
-                f"flat round dense color={'green-5' if controller_layout != 'none' else 'grey-7'}")
-            with controller_button:
-                controller_tooltip = ui.tooltip(f"{controller_status} (click for mapping)")
+                with ui.row().classes("order-last w-full sm:order-none sm:w-auto sm:flex-1 items-center no-wrap gap-1 min-w-0"):
+                    connection_dot = ui.icon("circle", size="xs", color=connection_summary()[0])
+                    connection_display = ui.label(connection_summary()[1]).classes("truncate text-sm")
 
-            # phone: small fixed-width bar. desktop: stretches to fill the line.
-            with ui.row().classes("w-20 items-center no-wrap gap-2 sm:flex-1 sm:w-auto sm:min-w-24"):
-                ui.label("Battery").classes("max-sm:hidden whitespace-nowrap")
-                battery_display = ui.linear_progress(show_value=False, size="20px", color=None).classes("grow rounded")
-                with battery_display:
-                    battery_label = ui.label().classes("absolute-center text-xs sm:text-sm text-white")
+                with ui.dialog() as mapping_dialog, ui.card().classes("gap-1").style("max-width: 95vw !important; width: 1000px; overflow-x: auto"):
+                    with ui.row().classes("w-full items-center justify-between no-wrap"):
+                        ui.label("Controller mapping").classes("text-lg font-medium")
+                        ui.button(icon="close", on_click=lambda: mapping_dialog.close()).props("flat round dense")
+                    mapping_view()
+                controller_button = ui.button(on_click=open_mapping).props(f"flat round dense {controller_icon_props()}").classes("xl:order-2")
+                with controller_button:
+                    controller_tooltip = ui.tooltip(f"{controller_status} (click for mapping)")
 
-            # phone: full-width 5-column row under the header. desktop: inline at the end.
-            with ui.element("div").classes("grid grid-cols-5 gap-2 w-full sm:flex sm:w-auto"):
-                action = dict(color="#FFAE00")
-                action_classes = "min-w-0 px-1 text-xs sm:px-3 sm:text-sm"
-                get_up_button = ui.button(text="GET UP", on_click=lambda: send_action("get_up"), **action).props("dense").classes(action_classes)
-                with ui.dropdown_button("ACTIONS", auto_close=True, **action).props("dense").classes(action_classes):
-                    with ui.item(on_click=toggle_wave):
-                        wave_label = ui.item_section("WAVE")
-                    with ui.item(on_click=random_dance_from_ui) as dance_item:
-                        ui.item_section("DANCE")
-                    dance_item.set_visibility(False)  # refresh() shows it once the bridge is up
-                chase_button = ui.button(text="CHASE", on_click=toggle_chase, **action).props("dense").classes(action_classes)
-                mode_button = ui.button(text="WALK", on_click=toggle_robot_mode, **action).props("dense outline").classes(action_classes)
-                recording_button = ui.button(text="RECORD", on_click=toggle_recording_from_ui, **action).props("dense").classes(action_classes)
-                with recording_button:
-                    rec_light = ui.element("span").classes("rec-light" + (" rec-on" if recording_active else ""))
+                with ui.row().classes("items-center no-wrap gap-2 w-28 sm:w-56 xl:order-3"):
+                    ui.label("Battery").classes("max-sm:hidden whitespace-nowrap")
+                    battery_display = ui.linear_progress(show_value=False, size="20px", color=None).classes("grow rounded")
+                    with battery_display:
+                        battery_label = ui.label().classes("absolute-center text-xs sm:text-sm text-white")
 
-            recording_display = ui.label(recording_status).classes("w-full truncate text-center text-xs opacity-70")
+            with ui.row().classes("xl:contents w-full items-center gap-2"):
+                # phone: 3 columns (two rows). desktop: one inline row.
+                with ui.element("div").classes("grid grid-cols-3 gap-2 w-full sm:flex sm:w-auto"):
+                    action = dict(color="#FFAE00")
+                    action_classes = "min-w-0 px-1 text-xs sm:px-3 sm:text-sm"
+                    get_up_button = ui.button(text="GET UP", on_click=lambda: run_robot_action("Get up", send_action, "get_up"), **action).props("dense").classes(action_classes)
+                    with ui.dropdown_button("ACTIONS", auto_close=True, **action).props("dense").classes(action_classes) as actions_button:
+                        with ui.item(on_click=lambda: run_robot_action("Wave", toggle_wave)):
+                            wave_label = ui.item_section("WAVE")
+                        with ui.item(on_click=random_dance_from_ui) as dance_item:
+                            ui.item_section("DANCE")
+                        dance_item.set_visibility(False)  # refresh() shows it once the bridge is up
+                    chase_button = ui.button(text="CHASE", on_click=toggle_chase, **action).props("dense").classes(action_classes)
+                    mode_button = ui.button(text="WALK", on_click=lambda: run_robot_action("Stand" if state["walking"] else "Walk", toggle_robot_mode), **action).props("dense outline").style("color: #FFAE00 !important").classes(action_classes)
+                    recording_button = ui.button(text="RECORD", on_click=toggle_recording_from_ui, **action).props("dense").classes(action_classes)
+                    with recording_button:
+                        rec_light = ui.element("span").classes("rec-light" + (" rec-on" if recording_active else ""))
 
         with ui.element("div").classes("stage"):
-            with ui.element("div").classes("video w-full relative flex gap-1") as video:
-                imgs = {cam: ui.interactive_image().classes("min-w-0 flex-1 cursor-pointer") for cam in CAMERAS}
-                for cam, img in imgs.items():
-                    img.on("click", lambda _, cam=cam: toggle_focus(cam))
-                ui.toggle(list(VIEWS), value=view["mode"], on_change=lambda e: view.update(mode=e.value)).props("dense toggle-color=amber-8").classes("absolute top-2 left-2 bg-black/60 rounded")
-                ui.button(icon="fullscreen", on_click=lambda: ui.run_javascript(f"getHtmlElement({video.id}).requestFullscreen()")).props("flat round dense color=white").classes("absolute top-2 right-2")
+            with ui.element("div").classes("panel video w-full flex flex-col gap-2") as video:
+                with ui.row().classes("w-full items-center justify-between gap-2"):
+                    ui.toggle(list(VIEWS), value=view["mode"], on_change=lambda e: view.update(mode=e.value)).props("dense toggle-color=amber-8")
+                    recording_display = ui.label(recording_status).classes("order-last w-full sm:order-none sm:w-auto sm:flex-1 truncate text-xs opacity-80 text-center")
+                    with ui.row().classes("items-center no-wrap gap-3"):
+                        ui.label("WALK SPEED").classes("text-xs opacity-70 whitespace-nowrap")
+                        speed_slider = ui.slider(min=10, max=100, step=5, value=round(max_mag * 100),
+                                                 on_change=lambda e: set_speed_limit(e.value)).props('color=amber-8 track-size=4px thumb-size=16px thumb-path="M7,3 h6 v14 h-6 z"').classes("w-28 sm:w-40")
+                        ui.label().classes("w-10 text-right text-xs opacity-80").bind_text_from(speed_slider, "value", lambda v: f"{v:.0f}%")
+                    ui.button(icon="fullscreen", on_click=lambda: ui.run_javascript(f"getHtmlElement({video.id}).requestFullscreen()")).props("flat round dense color=white")
+                with ui.element("div").classes("frames relative w-full flex gap-1"):
+                    imgs = {cam: ui.interactive_image().classes("min-w-0 flex-1 cursor-pointer") for cam in CAMERAS}
+                    for cam, img in imgs.items():
+                        img.on("click", lambda _, cam=cam: toggle_focus(cam))
+                    with ui.element("div").classes("absolute inset-x-0 bottom-6 flex justify-center pointer-events-none") as no_video_bubble:
+                        with ui.row().classes("reason-bubble items-center no-wrap gap-2 px-4 py-2 rounded-lg shadow-lg") as reason_bubble:
+                            reason_icon = ui.icon("videocam_off", size="sm")
+                            no_video_label = ui.label().classes("text-sm")
+                    no_video_bubble.set_visibility(False)
             left_stick = ui.joystick(
                 color='#FFAE00',
                 mode='static',
@@ -1458,9 +1588,11 @@ def index():
                 size=200,
             ).classes("stick-right")
 
+    robot_controls = (get_up_button, actions_button, chase_button, mode_button)
     last = {
         "n": {},
         "ips": len(ip_list),
+        "ip": robot_ip,
         "controller": controller_status,
         "recording_status": recording_status,
         "recording_active": recording_active,
