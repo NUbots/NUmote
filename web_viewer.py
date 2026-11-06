@@ -36,10 +36,14 @@ ip_list = [] # this is the list of discovered Robot IPs
 video_stream_port = 51111 # this seems to be standard for the Boosters.
 discovery_port = 9000 # found with WireShark
 KICK_ACTION = os.environ.get("NUMOTE_KICK_ACTION", "kick")
+DEFAULT_AGENT_ID = "com.boosterobotics.default"
 SOCCER_AGENT_ID = "com.boosterobotics.soccer"
 SOCCER_KICK_ACTION = os.environ.get("NUMOTE_SOCCER_KICK_ACTION_ID", "visual_kick_ball")
+KICK_LATCH_SECONDS = 5  # the soccer kick stays latched on until it's switched off, so it's released after this long
 STRONG_KICK_PORT = int(os.environ.get("NUMOTE_STRONG_KICK_PORT", "51121"))
-STRONG_KICK_TOKEN = os.environ.get("NUMOTE_STRONG_KICK_TOKEN", "")
+# shared with the bridge each time this app starts it, so the strong kick and dance work without any setup;
+# set NUMOTE_STRONG_KICK_TOKEN to pin one instead
+STRONG_KICK_TOKEN = os.environ.get("NUMOTE_STRONG_KICK_TOKEN") or secrets.token_hex(32)
 
 CAMERAS = ("left", "right")  # index matches the camera id sent by NUmote_bridge.py
 STREAM_DEPTH = len(CAMERAS)  # stream ids after the cameras, matching NUmote_bridge.py
@@ -61,7 +65,7 @@ state = {
     "depth": None, "depth_count": 0,  # raw 16-bit depth PNG
     "depth_view": None, "depth_view_count": -1,  # its colormapped JPEG, made on demand
     "detections": [], "detections_count": 0,  # [{label, confidence, box: [xmin, ymin, xmax, ymax]}]
-    "battery": None, "waving": False, "chasing": False, "walking": False,
+    "battery": None, "waving": False, "chasing": False, "kicking": False, "walking": False,
 }
 recording_status = "Not recording"
 recording_active = False
@@ -847,7 +851,7 @@ def extract_battery(msg: bytes):
     return None
 
 def run_button_action(action, name, detected_at):
-    worker_started = time.perf_counter()
+
     action()
 
 def _recv_exact(sock, size):
@@ -1228,18 +1232,70 @@ async def run_robot_action(label, action, *args):
     else:
         notify(f"{label} was rejected", type="negative")
 
-def send_soccer_kick():
-    try:
-        succeeded = send_action(SOCCER_KICK_ACTION, agent=SOCCER_AGENT_ID)
-    except Exception as e:
-        print(f"Soccer Kick Ball request failed: {e}")
-        succeeded = False
+def ensure_agent(agent):
+    """Make sure the robot is running this agent, switching to it if needed. Returns True once it is."""
+    reply = start_agent(agent)  # replies just_started false when it was already running, so this is always safe
+    if not reply.get("success"):
+        return False
+    if reply.get("result", {}).get("just_started"):
+        # switching agents resets the other agent's toggles
+        if agent == DEFAULT_AGENT_ID:
+            state.update(chasing=False, kicking=False)
+        else:
+            state.update(waving=False)
+        time.sleep(4)  # its buttons show up ~2.7 s after start_agent
+    return True
 
-    if not succeeded:
+kick_lock = threading.RLock()
+kick_timer = None
+
+def stop_soccer_kick():
+    """Release the kick latch; if the robot won't take that, leave the soccer agent instead."""
+    global kick_timer
+    with kick_lock:
+        if kick_timer:
+            kick_timer.cancel()
+            kick_timer = None
+        if not state["kicking"]:
+            return True
+        state["kicking"] = False
+        try:
+            released = send_action(SOCCER_KICK_ACTION, 1, SOCCER_AGENT_ID)
+        except Exception as e:
+            print(f"Soccer Kick Ball release failed: {e}")
+            released = False
+        if released:
+            print("Soccer Kick Ball released")
+            return True
+        print("Soccer Kick Ball release rejected; leaving the soccer agent")
+        try:
+            start_agent(DEFAULT_AGENT_ID)
+            state.update(chasing=False)
+        except Exception as e:
+            print(f"Couldn't leave the soccer agent: {e}")
         return False
 
-    print("Soccer Kick Ball accepted")
-    return True
+def send_soccer_kick():
+    """Latch the soccer kick on (starting the soccer agent if needed; chasing is left alone). Pressing again releases it."""
+    global kick_timer
+    with kick_lock:
+        if state["kicking"]:
+            return stop_soccer_kick()
+        try:
+            succeeded = ensure_agent(SOCCER_AGENT_ID) and send_action(SOCCER_KICK_ACTION, 0, SOCCER_AGENT_ID)
+        except Exception as e:
+            print(f"Soccer Kick Ball request failed: {e}")
+            succeeded = False
+
+        if not succeeded:
+            return False
+
+        state["kicking"] = True
+        kick_timer = threading.Timer(KICK_LATCH_SECONDS, stop_soccer_kick)
+        kick_timer.daemon = True
+        kick_timer.start()
+        print(f"Soccer Kick Ball accepted; releasing in {KICK_LATCH_SECONDS}s")
+        return True
 
 def send_robot_mode(mode: int):
     """Switch between STAND and WALK through the robot's app control endpoint."""
@@ -1261,7 +1317,8 @@ def toggle_robot_mode():
 def toggle_wave():
     # "state" is the toggle's current position, like the official app's switch:
     # 0 (currently off) starts the wave, 1 (currently on) stops it
-    succeeded = send_action("wave", 1 if state["waving"] else 0)
+    # wave lives on the default agent, which isn't running after the soccer agent (chase / kick) was started
+    succeeded = ensure_agent(DEFAULT_AGENT_ID) and send_action("wave", 1 if state["waving"] else 0, DEFAULT_AGENT_ID)
     if succeeded:
         state["waving"] = not state["waving"]  # only flip once the robot has the command
     return succeeded
@@ -1300,6 +1357,7 @@ async def toggle_chase(notify_user: bool = True):
             report("Couldn't start the Soccer agent", "negative")
             return
         if reply.get("result", {}).get("just_started"):
+            state["waving"] = False  # the default agent's toggles reset when it stops
             report("Switching to Soccer agent...")
             await asyncio.sleep(4)  # its buttons show up ~2.7 s after start_agent
     try:
@@ -1371,7 +1429,7 @@ def connect(ip):
     for task in (ws_task, relay_task):
         if task:
             task.cancel()
-    state.update(battery=None, waving=False, chasing=False, walking=False, seen=0.0, depth_seen=0.0, detections_seen=0.0)
+    state.update(battery=None, waving=False, chasing=False, kicking=False, walking=False, seen=0.0, depth_seen=0.0, detections_seen=0.0)
     bridge_hashes["remote"] = ""
     clear_frames(CAMERAS)
     clear_relay_streams()
@@ -1455,6 +1513,7 @@ def index():
         if record_text != last.get("record_text"):
             last["record_text"] = record_text
             recording_button.text = record_text
+        recording_button.classes(add="btn-on" if recording_active else "", remove="" if recording_active else "btn-on")
 
         if (len(ip_list), robot_ip) != last.get("ip_built") and not menu_state["open"]:  # ip_list only ever grows
             last["ip_built"] = (len(ip_list), robot_ip)
@@ -1479,10 +1538,12 @@ def index():
         if state["chasing"] != last.get("chasing"):
             last["chasing"] = state["chasing"]
             chase_button.text = "STOP CHASE" if state["chasing"] else "CHASE"
+            chase_button.classes(add="btn-on" if state["chasing"] else "", remove="" if state["chasing"] else "btn-on")
 
         if state["walking"] != last.get("walking"):
             last["walking"] = state["walking"]
             mode_button.text = "STAND" if state["walking"] else "WALK"
+            mode_button.classes(add="btn-on" if state["walking"] else "", remove="" if state["walking"] else "btn-on")
 
         for cam, img in imgs.items():
             if view["mode"] == "DEPTH" and cam == CAMERAS[0]:
@@ -1622,6 +1683,11 @@ def index():
         .nicegui-content { padding: 0.5rem; }
         @media (min-width: 640px) { .nicegui-content { padding: 1rem; } }
 
+        .amber-btn { color: #FFAE00 !important; }
+        .amber-btn.btn-on { background: #FFAE00 !important; color: #1a1a1a !important; }
+        .amber-toggle { border: 1px solid #FFAE00; }
+        .amber-toggle .q-btn { border-radius: 0; }
+
         .rec-light { display: inline-block; width: 0.8em; height: 0.8em; margin-left: 0.4em; border: 2px solid currentColor; border-radius: 50%; }
         .rec-light.rec-on { background: #ff2d2d; border-color: #ff2d2d; box-shadow: 0 0 8px #ff2d2d; animation: rec-blink 1s steps(1) infinite; }
         @keyframes rec-blink { 50% { background: transparent; box-shadow: none; } }
@@ -1743,22 +1809,93 @@ def index():
                 with ui.element("div").classes("grid grid-cols-2 gap-2 w-full sm:flex sm:flex-1 sm:w-auto sm:items-stretch"):
                     action = dict(color="#FFAE00")
                     action_classes = "min-w-0 h-9 px-1 text-xs sm:flex-1 sm:min-w-24 sm:px-3 sm:text-sm"
-                    mode_button = ui.button(text="WALK", on_click=lambda: run_robot_action("Stand" if state["walking"] else "Walk", toggle_robot_mode), **action).props("dense outline").style("color: #FFAE00 !important").classes(action_classes)
+                    mode_button = ui.button(text="WALK", on_click=lambda: run_robot_action("Stand" if state["walking"] else "Walk", toggle_robot_mode), **action).props("dense outline").classes(action_classes + " amber-btn")
                     with ui.element("div").classes("speed-pill min-w-0 sm:w-56 sm:shrink-0"):
                         ui.icon("speed", size="xs", color="amber-8")
                         speed_slider = ui.slider(min=10, max=100, step=5, value=round(max_mag * 100),
                                                 on_change=lambda e: set_speed_limit(e.value)).props('color=amber-8 track-size=4px thumb-size=16px thumb-path="M7,3 h6 v14 h-6 z"').classes("grow")
                         ui.label().classes("w-9 text-right text-xs opacity-80").bind_text_from(speed_slider, "value", lambda v: f"{v:.0f}%")
-                    chase_button = ui.button(text="CHASE", on_click=toggle_chase, **action).props("dense").classes(action_classes)
-                    with ui.dropdown_button("ACTIONS", auto_close=True, **action).props("dense").classes(action_classes) as actions_button:
+                    chase_button = ui.button(text="CHASE", on_click=toggle_chase, **action).props("dense outline").classes(action_classes + " amber-btn")
+                    with ui.dropdown_button("ACTIONS", auto_close=True, **action).props("dense outline").classes(action_classes + " amber-btn") as actions_button:
                         with ui.item(on_click=lambda: run_robot_action("Get up", send_action, "get_up")):
                             ui.item_section("GET UP")
                         with ui.item(on_click=lambda: run_robot_action("Wave", toggle_wave)):
                             wave_label = ui.item_section("WAVE")
+                        with ui.item(on_click=lambda: run_robot_action("Kick", send_soccer_kick)):
+                            ui.item_section("KICK")
                         with ui.item(on_click=random_dance_from_ui) as dance_item:
                             ui.item_section("DANCE")
                         dance_item.set_visibility(False)  # refresh() shows it once the bridge is up
                     with ui.element("div").classes("col-span-2 flex items-center gap-2 sm:col-span-1 sm:flex-1"):
-                        recording_button = ui.button(text="RECORD", on_click=toggle_recording_from_ui, **action).props("dense").classes(action_classes + " grow")
+                        recording_button = ui.button(text="RECORD", on_click=toggle_recording_from_ui, **action).props("dense outline").classes(action_classes + " amber-btn grow")
                         with recording_button:
                             rec_light = ui.element("span").classes("rec-light" + (" rec-on" if recording_active else ""))
+                        ui.button(icon="folder_open", on_click=open_recordings_folder).props("flat round dense color=white").classes("icon-btn").tooltip("Open recordings folder")
+
+        with ui.element("div").classes("stage"):
+            with ui.element("div").classes("panel video w-full flex flex-col gap-2") as video:
+                with ui.row().classes("w-full items-center justify-between gap-2"):
+                    ui.toggle(list(VIEWS), value=view["mode"], on_change=lambda e: view.update(mode=e.value)).props("dense unelevated color=transparent text-color=amber-8 toggle-color=amber-8 toggle-text-color=black").classes("amber-toggle")
+                    recording_display = ui.label(recording_status).classes("order-last w-full sm:order-none sm:w-auto sm:flex-1 truncate text-xs opacity-80 text-center")
+                    recording_display.set_visibility(False)  # refresh() shows it for 10 s after a recording ends
+                    ui.button(icon="fullscreen", on_click=lambda: ui.run_javascript(f"getHtmlElement({video.id}).requestFullscreen()")).props("flat round dense color=white").classes("icon-btn")
+                with ui.element("div").classes("frames relative w-full flex gap-1"):
+                    imgs = {cam: ui.interactive_image().classes("min-w-0 flex-1 cursor-pointer") for cam in CAMERAS}
+                    for cam, img in imgs.items():
+                        img.on("click", lambda _, cam=cam: toggle_focus(cam))
+                    with ui.element("div").classes("absolute inset-x-0 top-6 flex justify-center pointer-events-none") as no_video_bubble:
+                        with ui.row().classes("reason-bubble items-center no-wrap gap-2 px-4 py-2 rounded-lg shadow-lg") as reason_bubble:
+                            reason_icon = ui.icon("videocam_off", size="sm")
+                            no_video_label = ui.label().classes("text-sm")
+                    no_video_bubble.set_visibility(False)
+            left_stick = ui.joystick(
+                color='#FFAE00',
+                mode='static',
+                size=200,
+            ).classes("stick-left")
+            right_stick = ui.joystick(
+                color='#FFAE00',
+                mode='static',
+                size=200,
+            ).classes("stick-right")
+
+    robot_controls = (actions_button, chase_button, mode_button)
+    last = {
+        "n": {},
+        "ips": len(ip_list),
+        "ip": robot_ip,
+        "controller": controller_status,
+        "recording_status": recording_status,
+        "recording_status_at": time.monotonic(),
+        "recording_active": recording_active,
+    }
+
+    # sender is None until a robot is picked
+    left_stick.on_move(lambda e: sender and sender.set(*map_stick(e.y, -e.x, max_mag)))
+    left_stick.on_end(lambda e: sender and sender.release_move())
+    right_stick.on_move(lambda e: sender and sender.set_yaw(map_yaw(-e.x, max_yaw)))
+    right_stick.on_end(lambda e: sender and sender.release_yaw())
+
+    ui.run_javascript("""
+        // nipplejs knob; max travel is half the stick size (200 / 2)
+        window.moveKnob = (i, x, y) => {
+            const knob = document.querySelectorAll(".nipple .front")[i];
+            if (!knob) return;
+            const m = Math.hypot(x, y);
+            const k = m > 1 ? 1 / m : 1;
+            knob.style.transform = `translate(${x * k * 100}px, ${y * k * 100}px)`;
+        };
+    """)
+
+    def show_pad():
+        # mirror the physical controller onto the on-screen knobs
+        if pad_axes != last.get("pad"):
+            last["pad"] = pad_axes
+            lx, ly, rx, ry = pad_axes
+            ui.run_javascript(f"moveKnob(0,{lx},{ly});moveKnob(1,{rx},{ry})")
+
+    ui.timer(1 / 30, show_pad)
+
+    ui.timer(1 / 30, refresh)
+
+ui.run(port=int(os.environ.get("NUMOTE_WEB_PORT", "8080")), dark=True, title="NUmote", favicon="fav.png")
