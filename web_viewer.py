@@ -7,8 +7,8 @@ os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")  # no SDL win
 import pygame
 import pygame._sdl2.controller as sdl_controller
 from nicegui import app, ui
-from gprc_head import GrpcHead
-from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
+from grpc_control import GrpcHead, Sender
+from robot import extract_jpeg, map_stick, map_yaw, parse
 import hashlib, hmac, html, json, posixpath, secrets, shlex, socket
 import cv2
 import numpy as np
