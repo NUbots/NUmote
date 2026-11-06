@@ -110,7 +110,7 @@ left_trigger_was_pressed = False
 right_trigger_was_pressed = False
 
 SCP_LOCATION = "" # place we SCP the bridge to; empty = remote user's home directory
-ROBOT_SSH_USER = os.environ.get("NUMOTE_ROBOT_SSH_USER", "miles")
+ROBOT_SSH_USER = os.environ.get("NUMOTE_ROBOT_SSH_USER", "booster")
 
 class VideoRecorder:
     FPS = 30
