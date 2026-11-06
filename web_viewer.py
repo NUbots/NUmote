@@ -42,7 +42,7 @@ state = {
     "depth": None, "depth_count": 0,  # raw 16-bit depth PNG
     "depth_view": None, "depth_view_count": -1,  # its colormapped JPEG, made on demand
     "detections": [], "detections_count": 0,  # [{label, confidence, box: [xmin, ymin, xmax, ymax]}]
-    "battery": 0, "waving": False, "chasing": False,
+    "battery": 0, "waving": False, "chasing": False, "walking": False,
 }
 recording_status = "Not recording"
 recording_active = False
@@ -1089,7 +1089,13 @@ def send_robot_mode(mode: int):
         "app_api_level": 10800,
         "app_platform": "Android",
     }
-    return _send_robot_request(msg, f"robot mode {mode}")
+    succeeded = _send_robot_request(msg, f"robot mode {mode}")
+    if succeeded:
+        state["walking"] = mode == 2  # only flip once the robot has the command
+    return succeeded
+
+def toggle_robot_mode():
+    return send_robot_mode(1 if state["walking"] else 2)
 
 def toggle_wave():
     # "state" is the toggle's current position, like the official app's switch:
@@ -1195,7 +1201,7 @@ def connect(ip):
     for task in (ws_task, relay_task):
         if task:
             task.cancel()
-    state.update(battery=0, waving=False, chasing=False)
+    state.update(battery=0, waving=False, chasing=False, walking=False)
     clear_frames(CAMERAS)
     clear_relay_streams()
     ws_task = asyncio.create_task(ws_loop(f"ws://{ip}:{video_stream_port}/"))
@@ -1235,7 +1241,8 @@ def index():
     def refresh():
         if controller_status != last.get("controller"):
             last["controller"] = controller_status
-            controller_display.text = f"Controller: {controller_status}"
+            controller_tooltip.text = f"{controller_status} (click for mapping)"
+            controller_button.props(f"color={'green-5' if controller_layout != 'none' else 'grey-7'}")
 
         if recording_status != last.get("recording_status"):
             last["recording_status"] = recording_status
@@ -1243,6 +1250,10 @@ def index():
         if recording_active != last.get("recording_active"):
             last["recording_active"] = recording_active
             recording_button.text = "STOP REC" if recording_active else "RECORD"
+            if recording_active:
+                rec_light.classes(add="rec-on")
+            else:
+                rec_light.classes(remove="rec-on")
 
         if len(ip_list) != last["ips"]:  # ip_list only ever grows
             last["ips"] = len(ip_list)
@@ -1250,11 +1261,20 @@ def index():
 
         if state["waving"] != last.get("waving"):  # global, so every open page shows the same
             last["waving"] = state["waving"]
-            wave_button.text = "STOP WAVE" if state["waving"] else "WAVE"
+            wave_label.text = "STOP WAVE" if state["waving"] else "WAVE"
+
+        dance_ready = relay_active() and bool(STRONG_KICK_TOKEN)  # dance goes through the bridge's authenticated relay
+        if dance_ready != last.get("dance"):
+            last["dance"] = dance_ready
+            dance_item.set_visibility(dance_ready)
 
         if state["chasing"] != last.get("chasing"):
             last["chasing"] = state["chasing"]
             chase_button.text = "STOP CHASE" if state["chasing"] else "CHASE"
+
+        if state["walking"] != last.get("walking"):
+            last["walking"] = state["walking"]
+            mode_button.text = "STAND" if state["walking"] else "WALK"
 
         for cam, img in imgs.items():
             if view["mode"] == "DEPTH" and cam == CAMERAS[0]:
@@ -1326,6 +1346,10 @@ def index():
         .nicegui-content { padding: 0.5rem; }
         @media (min-width: 640px) { .nicegui-content { padding: 1rem; } }
 
+        .rec-light { display: inline-block; width: 0.7em; height: 0.7em; margin-left: 0.4em; border: 2px solid currentColor; border-radius: 50%; }
+        .rec-light.rec-on { background: #c91c1c; border-color: #c91c1c; animation: rec-blink 1s steps(1) infinite; }
+        @keyframes rec-blink { 50% { background: transparent; } }
+
         .mapping-title { font-size: 0.8rem; opacity: 0.7; }
         .mapping { width: 100%; min-width: 600px; height: auto; display: block; font-family: inherit; }
         .mapping .body { fill: url(#padbody); stroke: #3f3f3f; stroke-width: 2; }
@@ -1385,7 +1409,10 @@ def index():
                     ui.label("Controller mapping").classes("text-lg font-medium")
                     ui.button(icon="close", on_click=lambda: mapping_dialog.close()).props("flat round dense")
                 mapping_view()
-            ui.button(icon="sports_esports", on_click=open_mapping).props("flat round dense color=white").tooltip("Controller mapping")
+            controller_button = ui.button(icon="sports_esports", on_click=open_mapping).props(
+                f"flat round dense color={'green-5' if controller_layout != 'none' else 'grey-7'}")
+            with controller_button:
+                controller_tooltip = ui.tooltip(f"{controller_status} (click for mapping)")
 
             # phone: small fixed-width bar. desktop: stretches to fill the line.
             with ui.row().classes("w-20 items-center no-wrap gap-2 sm:flex-1 sm:w-auto sm:min-w-24"):
@@ -1399,23 +1426,26 @@ def index():
                 action = dict(color="#FFAE00")
                 action_classes = "min-w-0 px-1 text-xs sm:px-3 sm:text-sm"
                 get_up_button = ui.button(text="GET UP", on_click=lambda: send_action("get_up"), **action).props("dense").classes(action_classes)
-                wave_button = ui.button(text="WAVE", on_click=toggle_wave, **action).props("dense").classes(action_classes)
+                with ui.dropdown_button("ACTIONS", auto_close=True, **action).props("dense").classes(action_classes):
+                    with ui.item(on_click=toggle_wave):
+                        wave_label = ui.item_section("WAVE")
+                    with ui.item(on_click=random_dance_from_ui) as dance_item:
+                        ui.item_section("DANCE")
+                    dance_item.set_visibility(False)  # refresh() shows it once the bridge is up
                 chase_button = ui.button(text="CHASE", on_click=toggle_chase, **action).props("dense").classes(action_classes)
-                stand_button = ui.button(text="STAND", on_click=lambda: send_robot_mode(1), **action).props("dense").classes(action_classes)
-                walk_button = ui.button(text="WALK", on_click=lambda: send_robot_mode(2), **action).props("dense").classes(action_classes)
+                mode_button = ui.button(text="WALK", on_click=toggle_robot_mode, **action).props("dense outline").classes(action_classes)
                 recording_button = ui.button(text="RECORD", on_click=toggle_recording_from_ui, **action).props("dense").classes(action_classes)
-                dance_button = ui.button(text="DANCE", on_click=random_dance_from_ui, **action).props("dense").classes(action_classes)
+                with recording_button:
+                    rec_light = ui.element("span").classes("rec-light" + (" rec-on" if recording_active else ""))
 
-            controller_display = ui.label(f"Controller: {controller_status}").classes("w-full truncate text-center text-xs opacity-70")
             recording_display = ui.label(recording_status).classes("w-full truncate text-center text-xs opacity-70")
-
-        ui.toggle(list(VIEWS), value=view["mode"], on_change=lambda e: view.update(mode=e.value)).props("dense toggle-color=amber-8")
 
         with ui.element("div").classes("stage"):
             with ui.element("div").classes("video w-full relative flex gap-1") as video:
                 imgs = {cam: ui.interactive_image().classes("min-w-0 flex-1 cursor-pointer") for cam in CAMERAS}
                 for cam, img in imgs.items():
                     img.on("click", lambda _, cam=cam: toggle_focus(cam))
+                ui.toggle(list(VIEWS), value=view["mode"], on_change=lambda e: view.update(mode=e.value)).props("dense toggle-color=amber-8").classes("absolute top-2 left-2 bg-black/60 rounded")
                 ui.button(icon="fullscreen", on_click=lambda: ui.run_javascript(f"getHtmlElement({video.id}).requestFullscreen()")).props("flat round dense color=white").classes("absolute top-2 right-2")
             left_stick = ui.joystick(
                 color='#FFAE00',
