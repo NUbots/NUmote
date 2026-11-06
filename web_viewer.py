@@ -13,7 +13,24 @@ import hashlib, hmac, html, json, posixpath, secrets, shlex, socket
 import cv2
 import numpy as np
 
+SETTINGS_PATH = Path(__file__).with_name(".numote_settings.json")
+
+def load_settings():
+    try:
+        return json.loads(SETTINGS_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+
+def save_settings(**changes):
+    try:
+        SETTINGS_PATH.write_text(json.dumps({**load_settings(), **changes}))
+    except OSError as e:
+        print(f"couldn't save settings: {e}")
+
+settings = load_settings()
 robot_ip = "" # empty for now
+if not robot_ip:
+    robot_ip = str(settings.get("ip", ""))  # reconnect to the last robot used
 ip_list = [] # this is the list of discovered Robot IPs
 
 video_stream_port = 51111 # this seems to be standard for the Boosters.
@@ -35,6 +52,7 @@ VISION_INTERFACE_SETUP = os.environ.get(
     "/opt/booster/booster_agent_data/data/agents/extract/com.boosterobotics.soccer/agent/vision_interface/share/vision_interface/local_setup.bash",
 )  # robot path; provides the message type the bridge needs for detections
 relay_frame_at = 0.0  # monotonic time of the last relay frame
+bridge_hashes = {"local": "", "remote": ""}  # short SHA-256 prefixes; remote is "", "missing" or "?" when unknown
 bridge_status = ""  # progress of the SSH deploy and start, shown in the header
 
 state = {
@@ -54,8 +72,7 @@ video_recorders = {}  # "left" | "right" | "detections" -> VideoRecorder, "depth
 
 sender = None
 discovery_sock = None
-max_mag = 1
-max_yaw = 1
+max_mag = max_yaw = min(max(float(settings.get("speed", 100)), 10), 100) / 100
 
 pad = None
 controller = None
@@ -409,10 +426,16 @@ def robot_alive():
     """True while the robot's connection is delivering data."""
     return bool(robot_ip) and (relay_active() or time.monotonic() - state.get("seen", 0.0) < 6.0)
 
+def stream_row(name, seen_key):
+    """A relay stream is live while messages keep arriving; an empty detections list still counts."""
+    if time.monotonic() - state.get(seen_key, 0.0) < 5.0:
+        return (name, "green-5", "Receiving")
+    return (name, "amber-5", "Waiting for data" if relay_active() else "Needs the bridge")
+
 def connection_rows():
     """(label, Quasar colour, text) for each link, shown in the robot menu."""
     if not robot_ip:
-        return [(name, "grey-6", "-") for name in ("Robot", "Bridge", "Video", "Depth / detections")]
+        return [(name, "grey-6", "-") for name in ("Robot", "Bridge", "Bridge file", "Video", "Depth", "Detections")]
     has_video = any(state["jpeg"].values())
     robot_up = robot_alive()
     status = bridge_status or "Waiting"
@@ -422,12 +445,24 @@ def connection_rows():
         bridge = ("red-5", status)
     else:
         bridge = ("amber-5", status)
+    local, remote = bridge_hashes["local"], bridge_hashes["remote"]
+    if not remote:
+        file_row = ("amber-5", f"Not checked ({local})" if local else "Not checked")
+    elif remote == local:
+        file_row = ("green-5", f"Up to date ({local})")
+    elif remote == "missing":
+        file_row = ("red-5", "Missing on robot")
+    elif remote == "?":
+        file_row = ("amber-5", "Couldn't check")
+    else:
+        file_row = ("amber-5", f"Out of date ({remote} vs {local})")
     return [
         ("Robot", "green-5" if robot_up else "amber-5", "Connected" if robot_up else "Connecting..."),
         ("Bridge", *bridge),
+        ("Bridge file", *file_row),
         ("Video", "green-5" if has_video else "amber-5", "Streaming" if has_video else "No video yet"),
-        ("Depth / detections", "green-5" if state["depth"] else "amber-5",
-         "Receiving" if state["depth"] else ("Waiting for data" if relay_active() else "Needs the bridge")),
+        stream_row("Depth", "depth_seen"),
+        stream_row("Detections", "detections_seen"),
     ]
 
 def robot_icon_props():
@@ -441,6 +476,7 @@ def controller_icon_props():
 def set_speed_limit(percent):
     global max_mag, max_yaw
     max_mag = max_yaw = percent / 100
+    save_settings(speed=percent)
 
 def notify(message, **kwargs):
     ui.notify(message, position="top", **kwargs)
@@ -503,10 +539,12 @@ async def relay_loop(ip):
                     on_frame(CAMERAS[stream], payload)
                 elif stream == STREAM_DEPTH:
                     state["depth"] = payload
+                    state["depth_seen"] = time.monotonic()
                     state["depth_count"] += 1
                     add_recording_frame("depth", payload)
                 elif stream == STREAM_DETECTIONS:
                     state["detections"] = json.loads(payload)
+                    state["detections_seen"] = time.monotonic()
                     state["detections_count"] += 1
                     add_detections_record(state["detections"])
         except asyncio.CancelledError:
@@ -924,6 +962,7 @@ def confirm_bridge_with_robot(robot_ip):
     bridge_path = Path(__file__).with_name("NUmote_bridge.py")
     with open(bridge_path, "rb") as f:
         local_checksum = hashlib.file_digest(f, "sha256").hexdigest() # SHA256 seems alright
+    bridge_hashes["local"] = local_checksum[:8]
 
     remote_path = posixpath.join(SCP_LOCATION, bridge_path.name)
     command = [
@@ -937,17 +976,21 @@ def confirm_bridge_with_robot(robot_ip):
         result = subprocess.run(command, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as e:
         print(f"Bridge check failed: {e}")
+        bridge_hashes["remote"] = "?"
         return None
 
     # sha256sum exits 1 when it can't read the file; ssh itself exits 255 and a missing command exits 127
     if result.returncode == 1:
         print(f"Bridge missing or unreadable on {robot_ip}: {result.stderr.strip()}")
+        bridge_hashes["remote"] = "missing"
         return False
     if result.returncode != 0 or not result.stdout.strip():
         print(f"Bridge check failed: {result.stderr.strip()}")
+        bridge_hashes["remote"] = "?"
         return None
 
     remote_checksum = result.stdout.split()[0]
+    bridge_hashes["remote"] = remote_checksum[:8]
     if remote_checksum != local_checksum:
         print(f"Bridge out of date on {robot_ip}: local {local_checksum}, robot {remote_checksum}")
         return False
@@ -1128,6 +1171,27 @@ def start_bridged_mode(robot_ip):
 
 bridge_start_lock = threading.Lock()
 
+def refresh_bridge_file(ip):
+    """Re-check the robot's bridge against the local copy and SCP it over if they differ. Returns a (message, type) toast."""
+    if not bridge_start_lock.acquire(blocking=False):  # a start in progress is already doing this
+        return "The bridge is already being checked or started", "warning"
+    try:
+        current = confirm_bridge_with_robot(ip)
+        if current is None:
+            return "Couldn't check the robot's bridge", "negative"
+        if current:
+            return "Bridge is up to date", "positive"
+        if not transfer_bridge_to_robot(ip):
+            return "Couldn't copy the bridge to the robot", "negative"
+        if confirm_bridge_with_robot(ip) is not True:
+            return "Copied the bridge but it still doesn't match", "negative"
+        set_bridge_status(ip, "Starting bridge...")
+        started = start_bridge_on_robot(ip)
+        set_bridge_status(ip, "Bridge running" if started else "Bridge failed: start not confirmed (see console)")
+        return ("Bridge updated and restarted", "positive") if started else ("Bridge updated but it didn't start (see console)", "negative")
+    finally:
+        bridge_start_lock.release()
+
 def start_bridged_mode_for_connection(ip):
     # runs on its own thread so connect() doesn't wait on SSH; relay_loop picks the bridge up once it's running.
     with bridge_start_lock:  # a second start would kill the bridge the first is still waiting on
@@ -1307,7 +1371,8 @@ def connect(ip):
     for task in (ws_task, relay_task):
         if task:
             task.cancel()
-    state.update(battery=None, waving=False, chasing=False, walking=False, seen=0.0)
+    state.update(battery=None, waving=False, chasing=False, walking=False, seen=0.0, depth_seen=0.0, detections_seen=0.0)
+    bridge_hashes["remote"] = ""
     clear_frames(CAMERAS)
     clear_relay_streams()
     ws_task = asyncio.create_task(ws_loop(f"ws://{ip}:{video_stream_port}/"))
@@ -1399,7 +1464,6 @@ def index():
             last["ip"] = robot_ip
             ip_label.text = robot_ip or "NO ROBOT"
             menu_title.text = robot_ip or "NO ROBOT SELECTED"
-            restart_button.set_enabled(bool(robot_ip))
             robot_badge.set_visibility(bool(robot_ip))
             robot_button.classes(add="icon-on") if robot_ip else robot_button.classes(remove="icon-on")
 
@@ -1499,6 +1563,7 @@ def index():
             last["b"] = b
             battery_display.value = 0 if b is None else b / 100
             battery_label.text = "--" if b is None else f"{b:.0f}%"
+            battery_tooltip.text = "No battery data" if b is None else f"Battery {b:.0f}% ({'good' if b > 80 else 'ok' if b >= 30 else 'low'})"
 
             if b is None:  # no robot or no status message yet
                 battery_display.style('color: #6b6b6b')
@@ -1510,12 +1575,21 @@ def index():
                 battery_display.style('color: #c91c1c')
             battery_display.classes(add="battery-low") if b is not None and b < 30 else battery_display.classes(remove="battery-low")
 
+    async def refresh_bridge():
+        if not robot_ip:
+            notify("No robot selected", type="warning")
+            return
+        notify("Checking bridge...")
+        message, kind = await asyncio.to_thread(refresh_bridge_file, robot_ip)
+        notify(message, type=kind)
+
     async def reconnect(new_ip):
         # change the IP it wants to connect to (video + joystick)
         global robot_ip
         new_ip = new_ip.strip()
         if new_ip:
             robot_ip = new_ip
+            save_settings(ip=new_ip)
             connect(new_ip)
             notify(f"Connecting to {new_ip}")
             await asyncio.to_thread(start_sender, new_ip)  # shutdown of old sender blocks briefly
@@ -1643,10 +1717,9 @@ def index():
                                     dot = ui.icon("circle", size="xs", color=colour)
                                     ui.label(name).classes("text-sm opacity-80")
                                     status_text = ui.label(text).classes("text-sm ml-auto text-right")
+                                    if name == "Bridge file":
+                                        ui.button(icon="refresh", on_click=refresh_bridge).props("flat round dense size=sm color=amber-8").tooltip("Re-check the bridge; copy it and restart if it differs")
                                 status_rows[name] = (dot, status_text)
-                            ui.separator()
-                            restart_button = ui.button("Reconnect / restart bridge", icon="restart_alt", on_click=lambda: reconnect(robot_ip)).props("dense outline color=amber-8").classes("w-full text-xs")
-                            restart_button.set_enabled(bool(robot_ip))
                 ip_label = ui.label(robot_ip or "NO ROBOT").classes("max-sm:hidden text-xs font-medium opacity-80 whitespace-nowrap")
 
                 with ui.dialog() as mapping_dialog, ui.card().classes("gap-1").style("max-width: 95vw !important; width: 1000px; overflow-x: auto"):
@@ -1663,6 +1736,7 @@ def index():
                     battery_display = ui.linear_progress(show_value=False, size="20px", color=None).classes("grow rounded")
                     with battery_display:
                         battery_label = ui.label().classes("absolute-center text-xs sm:text-sm text-white")
+                    battery_tooltip = ui.tooltip("No battery data")
 
             with ui.row().classes("xl:contents w-full items-center gap-2"):
                 # phone: 2 columns, WALK + speed share the first row. desktop: one inline row.
@@ -1673,7 +1747,7 @@ def index():
                     with ui.element("div").classes("speed-pill min-w-0 sm:w-56 sm:shrink-0"):
                         ui.icon("speed", size="xs", color="amber-8")
                         speed_slider = ui.slider(min=10, max=100, step=5, value=round(max_mag * 100),
-                                                 on_change=lambda e: set_speed_limit(e.value)).props('color=amber-8 track-size=4px thumb-size=16px thumb-path="M7,3 h6 v14 h-6 z"').classes("grow")
+                                                on_change=lambda e: set_speed_limit(e.value)).props('color=amber-8 track-size=4px thumb-size=16px thumb-path="M7,3 h6 v14 h-6 z"').classes("grow")
                         ui.label().classes("w-9 text-right text-xs opacity-80").bind_text_from(speed_slider, "value", lambda v: f"{v:.0f}%")
                     chase_button = ui.button(text="CHASE", on_click=toggle_chase, **action).props("dense").classes(action_classes)
                     with ui.dropdown_button("ACTIONS", auto_close=True, **action).props("dense").classes(action_classes) as actions_button:
@@ -1688,72 +1762,3 @@ def index():
                         recording_button = ui.button(text="RECORD", on_click=toggle_recording_from_ui, **action).props("dense").classes(action_classes + " grow")
                         with recording_button:
                             rec_light = ui.element("span").classes("rec-light" + (" rec-on" if recording_active else ""))
-                        ui.button(icon="folder_open", on_click=open_recordings_folder).props("flat round dense color=white").classes("icon-btn").tooltip("Open recordings folder")
-
-        with ui.element("div").classes("stage"):
-            with ui.element("div").classes("panel video w-full flex flex-col gap-2") as video:
-                with ui.row().classes("w-full items-center justify-between gap-2"):
-                    ui.toggle(list(VIEWS), value=view["mode"], on_change=lambda e: view.update(mode=e.value)).props("dense toggle-color=amber-8")
-                    recording_display = ui.label(recording_status).classes("order-last w-full sm:order-none sm:w-auto sm:flex-1 truncate text-xs opacity-80 text-center")
-                    recording_display.set_visibility(False)  # refresh() shows it for 10 s after a recording ends
-                    ui.button(icon="fullscreen", on_click=lambda: ui.run_javascript(f"getHtmlElement({video.id}).requestFullscreen()")).props("flat round dense color=white").classes("icon-btn")
-                with ui.element("div").classes("frames relative w-full flex gap-1"):
-                    imgs = {cam: ui.interactive_image().classes("min-w-0 flex-1 cursor-pointer") for cam in CAMERAS}
-                    for cam, img in imgs.items():
-                        img.on("click", lambda _, cam=cam: toggle_focus(cam))
-                    with ui.element("div").classes("absolute inset-x-0 top-6 flex justify-center pointer-events-none") as no_video_bubble:
-                        with ui.row().classes("reason-bubble items-center no-wrap gap-2 px-4 py-2 rounded-lg shadow-lg") as reason_bubble:
-                            reason_icon = ui.icon("videocam_off", size="sm")
-                            no_video_label = ui.label().classes("text-sm")
-                    no_video_bubble.set_visibility(False)
-            left_stick = ui.joystick(
-                color='#FFAE00',
-                mode='static',
-                size=200,
-            ).classes("stick-left")
-            right_stick = ui.joystick(
-                color='#FFAE00',
-                mode='static',
-                size=200,
-            ).classes("stick-right")
-
-    robot_controls = (actions_button, chase_button, mode_button)
-    last = {
-        "n": {},
-        "ips": len(ip_list),
-        "ip": robot_ip,
-        "controller": controller_status,
-        "recording_status": recording_status,
-        "recording_status_at": time.monotonic(),
-        "recording_active": recording_active,
-    }
-
-    # sender is None until a robot is picked
-    left_stick.on_move(lambda e: sender and sender.set(*map_stick(e.y, -e.x, max_mag)))
-    left_stick.on_end(lambda e: sender and sender.release_move())
-    right_stick.on_move(lambda e: sender and sender.set_yaw(map_yaw(-e.x, max_yaw)))
-    right_stick.on_end(lambda e: sender and sender.release_yaw())
-
-    ui.run_javascript("""
-        // nipplejs knob; max travel is half the stick size (200 / 2)
-        window.moveKnob = (i, x, y) => {
-            const knob = document.querySelectorAll(".nipple .front")[i];
-            if (!knob) return;
-            const m = Math.hypot(x, y);
-            const k = m > 1 ? 1 / m : 1;
-            knob.style.transform = `translate(${x * k * 100}px, ${y * k * 100}px)`;
-        };
-    """)
-
-    def show_pad():
-        # mirror the physical controller onto the on-screen knobs
-        if pad_axes != last.get("pad"):
-            last["pad"] = pad_axes
-            lx, ly, rx, ry = pad_axes
-            ui.run_javascript(f"moveKnob(0,{lx},{ly});moveKnob(1,{rx},{ry})")
-
-    ui.timer(1 / 30, show_pad)
-
-    ui.timer(1 / 30, refresh)
-
-ui.run(port=int(os.environ.get("NUMOTE_WEB_PORT", "8080")), dark=True, title="NUmote", favicon="fav.png")

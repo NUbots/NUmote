@@ -278,11 +278,12 @@ class Sender(threading.Thread):
                     self.failed_calls = 0
                     self.max_rpc_ms = 0.0
                 error = f", last_error={last_error}" if last_error else ""
-                print(
-                    f"joystick rpc: completed={completed}, failed={failures}, "
-                    f"in_flight={in_flight}/{self.max_in_flight}, skipped={skipped}, "
-                    f"last={last_rpc_ms:.1f} ms, max={max_rpc_ms:.1f} ms{error}"
-                )
+                if failures or last_error:  # healthy periods stay quiet; the viewer prints a heartbeat
+                    print(
+                        f"joystick rpc: completed={completed}, failed={failures}, "
+                        f"in_flight={in_flight}/{self.max_in_flight}, skipped={skipped}, "
+                        f"last={last_rpc_ms:.1f} ms, max={max_rpc_ms:.1f} ms{error}"
+                    )
                 self.next_diagnostic_at = now + 1.0
             nxt += self.dt
             delay = nxt - time.monotonic()
