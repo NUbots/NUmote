@@ -1541,11 +1541,12 @@ def index():
 
             with ui.row().classes("xl:contents w-full items-center gap-2"):
                 # phone: 3 columns (two rows). desktop: one inline row.
-                with ui.element("div").classes("grid grid-cols-3 gap-2 w-full sm:flex sm:w-auto"):
+                with ui.element("div").classes("grid grid-cols-2 gap-2 w-full sm:flex sm:w-auto"):
                     action = dict(color="#FFAE00")
                     action_classes = "min-w-0 px-1 text-xs sm:px-3 sm:text-sm"
-                    get_up_button = ui.button(text="GET UP", on_click=lambda: run_robot_action("Get up", send_action, "get_up"), **action).props("dense").classes(action_classes)
                     with ui.dropdown_button("ACTIONS", auto_close=True, **action).props("dense").classes(action_classes) as actions_button:
+                        with ui.item(on_click=lambda: run_robot_action("Get up", send_action, "get_up")):
+                            ui.item_section("GET UP")
                         with ui.item(on_click=lambda: run_robot_action("Wave", toggle_wave)):
                             wave_label = ui.item_section("WAVE")
                         with ui.item(on_click=random_dance_from_ui) as dance_item:
@@ -1588,7 +1589,7 @@ def index():
                 size=200,
             ).classes("stick-right")
 
-    robot_controls = (get_up_button, actions_button, chase_button, mode_button)
+    robot_controls = (actions_button, chase_button, mode_button)
     last = {
         "n": {},
         "ips": len(ip_list),
