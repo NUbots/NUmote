@@ -9,7 +9,7 @@ import pygame._sdl2.controller as sdl_controller
 from nicegui import app, ui
 from gprc_head import GrpcHead
 from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
-import hashlib, hmac, json, posixpath, secrets, shlex, socket
+import hashlib, hmac, html, json, posixpath, secrets, shlex, socket
 
 robot_ip = "" # empty for now
 ip_list = [] # this is the list of discovered Robot IPs
@@ -22,13 +22,22 @@ SOCCER_KICK_ACTION = os.environ.get("NUMOTE_SOCCER_KICK_ACTION_ID", "visual_kick
 STRONG_KICK_PORT = int(os.environ.get("NUMOTE_STRONG_KICK_PORT", "51121"))
 STRONG_KICK_TOKEN = os.environ.get("NUMOTE_STRONG_KICK_TOKEN", "")
 
-CAMERAS = ("left", "right")  # index matches the camera id sent by k1_camera_relay.py
+CAMERAS = ("left", "right")  # index matches the camera id sent by NUmote_bridge.py
+STREAM_DEPTH = len(CAMERAS)  # stream ids after the cameras, matching NUmote_bridge.py
+STREAM_DETECTIONS = STREAM_DEPTH + 1
+VIEWS = ("RAW", "DEPTH", "DETECTIONS")
 CAMERA_RELAY_PORT = int(os.environ.get("NUMOTE_CAMERA_RELAY_PORT", "51120"))
+VISION_INTERFACE_SETUP = os.environ.get(
+    "NUMOTE_VISION_INTERFACE_SETUP",
+    "/opt/booster/booster_agent_data/data/agents/extract/com.boosterobotics.soccer/agent/vision_interface/share/vision_interface/local_setup.bash",
+)  # robot path; provides the message type the bridge needs for detections
 relay_frame_at = 0.0  # monotonic time of the last relay frame
 
 state = {
     "jpeg": {cam: None for cam in CAMERAS},
     "count": {cam: 0 for cam in CAMERAS},
+    "depth": None, "depth_count": 0,  # colormapped depth JPEG
+    "detections": [], "detections_count": 0,  # [{label, confidence, box: [xmin, ymin, xmax, ymax]}]
     "battery": 0, "waving": False, "chasing": False,
 }
 recording_status = "Not recording"
@@ -122,7 +131,7 @@ class VideoRecorder:
                 ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                 "-f", "image2pipe", "-framerate", str(self.FPS), "-vcodec", "mjpeg", "-i", "pipe:0",
                 "-an", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(self.path),
             ],
             stdin=subprocess.PIPE,
@@ -277,6 +286,22 @@ def clear_frames(cameras):
             state["jpeg"][cam] = None
             state["count"][cam] += 1
 
+def clear_relay_streams():
+    if state["depth"]:
+        state["depth"] = None
+        state["depth_count"] += 1
+    if state["detections"]:
+        state["detections"] = []
+        state["detections_count"] += 1
+
+def detections_svg(detections):
+    """Boxes and labels in image pixels; the overlay's viewport has the image's dimensions."""
+    return "".join(
+        f'<rect x="{x0}" y="{y0}" width="{x1 - x0}" height="{y1 - y0}" fill="none" stroke="#FFAE00" stroke-width="2"/>'
+        f'<text x="{x0}" y="{max(y0 - 3, 10)}" fill="#FFAE00" font-size="12">{html.escape(d["label"])} {d["confidence"]:.0f}%</text>'
+        for d in detections for x0, y0, x1, y1 in [d["box"]]
+    )
+
 async def relay_loop(ip):
     """Both head cameras from k1_camera_relay.py running on the robot."""
     global relay_frame_at
@@ -288,11 +313,17 @@ async def relay_loop(ip):
             print(f"camera relay connected ({ip}:{CAMERA_RELAY_PORT})")
             last_error = None
             while True:
-                cam, size = struct.unpack("<BI", await asyncio.wait_for(reader.readexactly(5), timeout=5))
-                jpeg = await reader.readexactly(size)
-                if cam < len(CAMERAS):
+                stream, size = struct.unpack("<BI", await asyncio.wait_for(reader.readexactly(5), timeout=5))
+                payload = await reader.readexactly(size)
+                if stream < len(CAMERAS):
                     relay_frame_at = time.monotonic()
-                    on_frame(CAMERAS[cam], jpeg)
+                    on_frame(CAMERAS[stream], payload)
+                elif stream == STREAM_DEPTH:
+                    state["depth"] = payload
+                    state["depth_count"] += 1
+                elif stream == STREAM_DETECTIONS:
+                    state["detections"] = json.loads(payload)
+                    state["detections_count"] += 1
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -301,6 +332,7 @@ async def relay_loop(ip):
                 print(f"camera relay unavailable ({error}); showing the app stream, retrying every 2s")
                 last_error = error
             clear_frames(CAMERAS[1:])
+            clear_relay_streams()
         finally:
             if writer:
                 writer.close()
@@ -818,6 +850,7 @@ def start_bridge_on_robot(robot_ip):
         # SSH_CONNECTION's first field is this host's address as the robot sees it.
         script = f"""
 source /opt/ros/humble/setup.bash || exit 1
+source {shlex.quote(VISION_INTERFACE_SETUP)} || exit 1
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp RMW_FASTRTPS_USE_QOS_FROM_XML=0
 export FASTRTPS_DEFAULT_PROFILES_FILE=/opt/booster/config/dds_configs/single-board_configs/fastdds_profile.xml
 export NUMOTE_STRONG_KICK_TOKEN={shlex.quote(STRONG_KICK_TOKEN)}
@@ -1051,6 +1084,7 @@ def connect(ip):
             task.cancel()
     state.update(battery=0, waving=False, chasing=False)
     clear_frames(CAMERAS)
+    clear_relay_streams()
     ws_task = asyncio.create_task(ws_loop(f"ws://{ip}:{video_stream_port}/"))
     relay_task = asyncio.create_task(relay_loop(ip))
     threading.Thread(target=start_bridged_mode_for_connection, args=(ip,), daemon=True).start()
@@ -1110,14 +1144,23 @@ def index():
             chase_button.text = "STOP CHASE" if state["chasing"] else "CHASE"
 
         for cam, img in imgs.items():
-            if state["count"][cam] == last["n"].get(cam):
+            if view["mode"] == "DEPTH" and cam == CAMERAS[0]:
+                jpeg, count = state["depth"], state["depth_count"]
+            else:
+                jpeg, count = state["jpeg"][cam], state["count"][cam]
+            key = (view["mode"] == "DEPTH", count)  # the flag forces a redraw when the mode swaps the source
+            if key == last["n"].get(cam):
                 continue
-            last["n"][cam] = state["count"][cam]
-            jpeg = state["jpeg"][cam]
+            last["n"][cam] = key
             if jpeg:
                 img.set_source("data:image/jpeg;base64," + base64.b64encode(jpeg).decode())
             else:
                 img.set_source("no_video.jpg")
+
+        det_key = (view["mode"] == "DETECTIONS", state["detections_count"])
+        if det_key != last.get("det"):
+            last["det"] = det_key
+            imgs[CAMERAS[0]].content = detections_svg(state["detections"]) if det_key[0] else ""
         apply_video_layout()
 
         # decode some battery stuff and update the battery label
@@ -1148,8 +1191,8 @@ def index():
         await asyncio.to_thread(toggle_video_recording)
 
     def apply_video_layout():
-        # the second view stays hidden until it has frames
-        live = {cam: cam == CAMERAS[0] or state["jpeg"][cam] is not None for cam in CAMERAS}
+        # the second view stays hidden until it has frames; depth and detections are left camera only
+        live = {cam: cam == CAMERAS[0] or (view["mode"] == "RAW" and state["jpeg"][cam] is not None) for cam in CAMERAS}
         if focus["cam"] and not live[focus["cam"]]:
             focus["cam"] = None
         visible = tuple(live[cam] and focus["cam"] in (None, cam) for cam in CAMERAS)
@@ -1164,6 +1207,7 @@ def index():
         apply_video_layout()
 
     focus = {"cam": None}  # per page, so each viewer picks its own layout
+    view = {"mode": VIEWS[0]}  # per page, one of VIEWS
 
     ui.add_css("""
         .nicegui-content { padding: 0.5rem; }
@@ -1251,6 +1295,8 @@ def index():
 
             controller_display = ui.label(f"Controller: {controller_status}").classes("w-full truncate text-center text-xs opacity-70")
             recording_display = ui.label(recording_status).classes("w-full truncate text-center text-xs opacity-70")
+
+        ui.toggle(list(VIEWS), value=view["mode"], on_change=lambda e: view.update(mode=e.value)).props("dense toggle-color=amber-8")
 
         with ui.element("div").classes("stage"):
             with ui.element("div").classes("video w-full relative flex gap-1") as video:
