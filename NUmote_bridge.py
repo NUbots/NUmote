@@ -6,7 +6,7 @@ The phone-app video stream (port 51111) only carries one camera, and DDS doesn't
 laptop, so this subscribes to both ROS 2 camera topics locally and forwards them as JPEGs.
 
 Wire format, repeated per message:  <u8 stream id> <u32 LE length> <payload>
-Stream ids: 0 = left camera JPEG, 1 = right camera JPEG, 2 = colormapped depth JPEG, 3 = detections JSON.
+Stream ids: 0 = left camera JPEG, 1 = right camera JPEG, 2 = raw 16-bit depth PNG, 3 = detections JSON.
 
 Run on the robot (the env vars match the robot's own camera process, otherwise no frames arrive):
 	source /opt/ros/humble/setup.bash
@@ -78,19 +78,19 @@ def to_bgr(msg):
 	return cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if msg.encoding == "rgb8" else img
 
 
-def to_depth_bgr(msg):
-	if msg.encoding != "mono16":
-		raise ValueError(f"unsupported depth encoding {msg.encoding}")
-	depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.step // 2)[:, :msg.width]
-	valid = depth > 0
-	if not valid.any():
-		return np.zeros((msg.height, msg.width, 3), np.uint8)
-	# scaled per frame because the depth units are unconfirmed; 0 means no measurement
-	near, far = np.percentile(depth[valid][::16], (1, 99))
-	scaled = np.clip((depth.astype(np.float32) - near) / max(far - near, 1) * 255, 0, 255).astype(np.uint8)
-	colored = cv2.applyColorMap(scaled, cv2.COLORMAP_TURBO)
-	colored[~valid] = 0
-	return colored
+def on_depth(msg):
+	if not clients:
+		return
+	try:
+		if msg.encoding != "mono16":
+			raise ValueError(f"unsupported depth encoding {msg.encoding}")
+		depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.step // 2)[:, :msg.width]
+		ok, png = cv2.imencode(".png", np.ascontiguousarray(depth), [cv2.IMWRITE_PNG_COMPRESSION, 1])  # lossless; low level to spare the robot's CPU
+	except Exception as e:
+		print(f"depth: can't encode {msg.encoding} {msg.width}x{msg.height}: {e}", flush=True)
+		return
+	if ok:
+		publish(DEPTH_STREAM, png.tobytes())
 
 
 def publish(stream, payload):
@@ -278,7 +278,7 @@ def main():
 	node = rclpy.create_node("numote_camera_relay")
 	for stream, topic in enumerate(TOPICS):
 		node.create_subscription(Image, topic, on_image(stream, to_bgr), qos_profile_sensor_data)
-	node.create_subscription(Image, DEPTH_TOPIC, on_image(DEPTH_STREAM, to_depth_bgr), qos_profile_sensor_data)
+	node.create_subscription(Image, DEPTH_TOPIC, on_depth, qos_profile_sensor_data)
 	node.create_subscription(Detections, DETECTIONS_TOPIC, on_detections, 10)
 
 	server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

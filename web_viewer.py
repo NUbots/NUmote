@@ -10,6 +10,8 @@ from nicegui import app, ui
 from gprc_head import GrpcHead
 from robot import Sender, extract_jpeg, map_stick, map_yaw, parse
 import hashlib, hmac, html, json, posixpath, secrets, shlex, socket
+import cv2
+import numpy as np
 
 robot_ip = "" # empty for now
 ip_list = [] # this is the list of discovered Robot IPs
@@ -26,6 +28,7 @@ CAMERAS = ("left", "right")  # index matches the camera id sent by NUmote_bridge
 STREAM_DEPTH = len(CAMERAS)  # stream ids after the cameras, matching NUmote_bridge.py
 STREAM_DETECTIONS = STREAM_DEPTH + 1
 VIEWS = ("RAW", "DEPTH", "DETECTIONS")
+DETECTION_BGR = (0, 174, 255)  # #FFAE00, the colour of the on-page boxes
 CAMERA_RELAY_PORT = int(os.environ.get("NUMOTE_CAMERA_RELAY_PORT", "51120"))
 VISION_INTERFACE_SETUP = os.environ.get(
     "NUMOTE_VISION_INTERFACE_SETUP",
@@ -36,7 +39,8 @@ relay_frame_at = 0.0  # monotonic time of the last relay frame
 state = {
     "jpeg": {cam: None for cam in CAMERAS},
     "count": {cam: 0 for cam in CAMERAS},
-    "depth": None, "depth_count": 0,  # colormapped depth JPEG
+    "depth": None, "depth_count": 0,  # raw 16-bit depth PNG
+    "depth_view": None, "depth_view_count": -1,  # its colormapped JPEG, made on demand
     "detections": [], "detections_count": 0,  # [{label, confidence, box: [xmin, ymin, xmax, ymax]}]
     "battery": 0, "waving": False, "chasing": False,
 }
@@ -44,7 +48,7 @@ recording_status = "Not recording"
 recording_active = False
 recording_stopping = False
 recording_lock = threading.Lock()
-video_recorders = {}  # camera -> VideoRecorder
+video_recorders = {}  # "left" | "right" | "detections" -> VideoRecorder, "depth" -> DepthRecorder, "detections_log" -> DetectionLog
 
 sender = None
 discovery_sock = None
@@ -136,7 +140,7 @@ class VideoRecorder:
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             bufsize=0,
         )
         self.worker = threading.Thread(target=self._write_frames, daemon=True)
@@ -189,8 +193,11 @@ class VideoRecorder:
                 self.process.kill()
                 return_code = self.process.wait()
                 self.error = self.error or "FFmpeg did not finish in time"
-            if return_code and not self.error:
-                self.error = f"FFmpeg exited with code {return_code}"
+            if return_code:
+                reason = self.error or f"FFmpeg exited with code {return_code}"
+                detail = self.process.stderr.read().decode(errors="replace").strip()
+                self.error = f"{reason}: {detail}" if detail else reason
+            self.process.stderr.close()
 
     def stop(self):
         with self.schedule_lock:
@@ -207,6 +214,64 @@ class VideoRecorder:
             self.worker.join()
         if self.error:
             raise RuntimeError(self.error)
+        return self.path
+
+class DepthRecorder:
+    """Saves each raw 16-bit depth PNG untouched as depth/<milliseconds since recording started>.png."""
+
+    def __init__(self, output_dir):
+        self.path = output_dir / "depth"
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.frames = queue.Queue(maxsize=120)
+        self.started = time.monotonic()
+        self.dropped_frames = 0
+        self.error = None
+        self.worker = threading.Thread(target=self._write_frames, daemon=True)
+        self.worker.start()
+
+    def add_frame(self, png):
+        name = f"{int((time.monotonic() - self.started) * 1000):09d}.png"
+        try:
+            self.frames.put_nowait((name, png))
+        except queue.Full:
+            self.dropped_frames += 1
+
+    def _write_frames(self):
+        while (item := self.frames.get()) is not None:
+            if self.error:  # keep draining so stop() never blocks on a full queue
+                continue
+            try:
+                (self.path / item[0]).write_bytes(item[1])
+            except OSError as e:
+                self.error = str(e)
+
+    def stop(self):
+        self.frames.put(None)
+        self.worker.join()
+        if self.error:
+            raise RuntimeError(self.error)
+        return self.path
+
+class DetectionLog:
+    """One JSON line per detections message: seconds since recording started, plus the objects."""
+    dropped_frames = 0
+
+    def __init__(self, output_dir):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.path = output_dir / "detections.jsonl"
+        self.file = open(self.path, "w")
+        self.started = time.monotonic()
+        self.lock = threading.Lock()
+
+    def add(self, objects):
+        record = {"t": round(time.monotonic() - self.started, 3), "objects": objects}
+        with self.lock:
+            if not self.file.closed:
+                self.file.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+    def stop(self):
+        with self.lock:
+            self.file.close()
         return self.path
 
 def stop_recorders(recorders):
@@ -237,6 +302,11 @@ def toggle_video_recording():
             try:
                 for cam in cameras:
                     recorders[cam] = VideoRecorder(output_dir, cam)
+                if state["depth"]:
+                    recorders["depth"] = DepthRecorder(output_dir)
+                if relay_active() and CAMERAS[0] in cameras:  # detections only come through the bridge
+                    recorders["detections"] = VideoRecorder(output_dir, "detections")
+                    recorders["detections_log"] = DetectionLog(output_dir)
             except Exception as e:
                 stop_recorders(recorders)
                 recording_status = f"Recording failed: {e}"
@@ -266,16 +336,39 @@ def toggle_video_recording():
             recording_stopping = False
             recording_active = False
 
-def add_recording_frame(cam, frame):
+def add_recording_frame(name, frame):
     with recording_lock:
-        recorder = video_recorders.get(cam)
+        recorder = video_recorders.get(name)
     if recorder:
         recorder.add_frame(frame)
+
+def draw_detections(jpeg, detections):
+    image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    for d in detections:
+        x0, y0, x1, y1 = d["box"]
+        cv2.rectangle(image, (x0, y0), (x1, y1), DETECTION_BGR, 2)
+        cv2.putText(image, f'{d["label"]} {d["confidence"]:.0f}%', (x0, max(y0 - 4, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, DETECTION_BGR, 1, cv2.LINE_AA)
+    return cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 98])[1].tobytes()
+
+def add_detections_frame(jpeg):
+    with recording_lock:
+        recorder = video_recorders.get("detections")
+    if recorder:  # drawn only while recording, since it costs a decode and re-encode per frame
+        recorder.add_frame(draw_detections(jpeg, state["detections"]))
+
+def add_detections_record(objects):
+    with recording_lock:
+        log = video_recorders.get("detections_log")
+    if log:
+        log.add(objects)
 
 def on_frame(cam, jpeg):
     state["jpeg"][cam] = jpeg
     state["count"][cam] += 1
     add_recording_frame(cam, jpeg)
+    if cam == CAMERAS[0]:
+        add_detections_frame(jpeg)
 
 def relay_active():
     return time.monotonic() - relay_frame_at < 2.0
@@ -293,6 +386,24 @@ def clear_relay_streams():
     if state["detections"]:
         state["detections"] = []
         state["detections_count"] += 1
+
+def colormap_depth(png):
+    depth = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED)
+    valid = depth > 0  # 0 means no measurement
+    colored = np.zeros((*depth.shape, 3), np.uint8)
+    if valid.any():
+        # scaled per frame because the depth units are unconfirmed
+        near, far = np.percentile(depth[valid][::16], (1, 99))
+        scaled = np.clip((depth.astype(np.float32) - near) / max(far - near, 1) * 255, 0, 255).astype(np.uint8)
+        colored = cv2.applyColorMap(scaled, cv2.COLORMAP_TURBO)
+        colored[~valid] = 0
+    return cv2.imencode(".jpg", colored, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
+
+def depth_view_jpeg():
+    if state["depth_view_count"] != state["depth_count"]:
+        state["depth_view"] = colormap_depth(state["depth"]) if state["depth"] else None
+        state["depth_view_count"] = state["depth_count"]
+    return state["depth_view"]
 
 def detections_svg(detections):
     """Boxes and labels in image pixels; the overlay's viewport has the image's dimensions."""
@@ -321,9 +432,11 @@ async def relay_loop(ip):
                 elif stream == STREAM_DEPTH:
                     state["depth"] = payload
                     state["depth_count"] += 1
+                    add_recording_frame("depth", payload)
                 elif stream == STREAM_DETECTIONS:
                     state["detections"] = json.loads(payload)
                     state["detections_count"] += 1
+                    add_detections_record(state["detections"])
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1145,7 +1258,7 @@ def index():
 
         for cam, img in imgs.items():
             if view["mode"] == "DEPTH" and cam == CAMERAS[0]:
-                jpeg, count = state["depth"], state["depth_count"]
+                jpeg, count = depth_view_jpeg(), state["depth_count"]
             else:
                 jpeg, count = state["jpeg"][cam], state["count"][cam]
             key = (view["mode"] == "DEPTH", count)  # the flag forces a redraw when the mode swaps the source
