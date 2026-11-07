@@ -39,7 +39,7 @@ KICK_ACTION = os.environ.get("NUMOTE_KICK_ACTION", "kick")
 DEFAULT_AGENT_ID = "com.boosterobotics.default"
 SOCCER_AGENT_ID = "com.boosterobotics.soccer"
 SOCCER_KICK_ACTION = os.environ.get("NUMOTE_SOCCER_KICK_ACTION_ID", "visual_kick_ball")
-KICK_LATCH_SECONDS = 5  # the soccer kick stays latched on until it's switched off, so it's released after this long
+KICK_LATCH_SECONDS = 8  # the soccer kick stays latched on until it's switched off, so it's released after this long
 STRONG_KICK_PORT = int(os.environ.get("NUMOTE_STRONG_KICK_PORT", "51121"))
 # shared with the bridge each time this app starts it, so the strong kick and dance work without any setup;
 # set NUMOTE_STRONG_KICK_TOKEN to pin one instead
@@ -83,6 +83,7 @@ controller = None
 controller_status = "No controller connected"
 controller_layout = "none"  # "none" | "raw" | "sdl" | "switch"
 pad_axes = (0.0, 0.0, 0.0, 0.0)  # lx, ly, rx, ry after dead zone
+axes_armed = False  # False until a freshly connected pad has reported a neutral stick reading
 deadzone = 0.15
 last_axis_log_at = 0.0
 # SDL joystick button index -> (name, action) on this pad
@@ -697,21 +698,24 @@ def start_pad():
 def poll_pad():
     """Read the controller through SDL and drive the robot."""
     global pad, controller, controller_status, controller_layout, pad_axes, buttons_down, last_axis_log_at
-    global record_combo_stage, left_trigger_was_pressed, right_trigger_was_pressed
+    global record_combo_stage, left_trigger_was_pressed, right_trigger_was_pressed, axes_armed
     pygame.event.pump()
     if any(event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED) for event in pygame.event.get()):
         pad = None
         controller = None
+        axes_armed = False
         buttons_down.clear()
 
     if pygame.joystick.get_count() == 0:
         pad = None
         controller = None
+        axes_armed = False
         controller_status = "No controller connected"
         controller_layout = "none"
     elif pad is None:
         pad = pygame.joystick.Joystick(0)
         controller = sdl_controller.Controller(0) if sdl_controller.is_controller(0) else None
+        axes_armed = False
         is_switch_layout = "nintendo switch" in pad.get_name().lower()
         controller_layout = "raw" if controller is None else "switch" if is_switch_layout else "sdl"
         mapping_status = (
@@ -800,7 +804,12 @@ def poll_pad():
             head.set_dir(*hat)
 
     if pad and pad.get_numaxes() >= 4:
-        axes = tuple(v if abs(v) >= deadzone else 0.0 for v in (pad.get_axis(i) for i in range(4)))
+        raw_axes = tuple(pad.get_axis(i) for i in range(4))
+        if not axes_armed:
+            # SDL reports unread axes as -1 until the first axis event; wait for a neutral reading
+            axes_armed = all(abs(v) < deadzone for v in raw_axes)
+            raw_axes = (0.0, 0.0, 0.0, 0.0)
+        axes = tuple(v if abs(v) >= deadzone else 0.0 for v in raw_axes)
     else:
         axes = (0.0, 0.0, 0.0, 0.0)
 

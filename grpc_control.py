@@ -277,6 +277,7 @@ class Sender(threading.Thread):
                     self.completed_calls = 0
                     self.failed_calls = 0
                     self.max_rpc_ms = 0.0
+                    self.last_rpc_error = ""  # reported once; a still-failing call sets it again
                 error = f", last_error={last_error}" if last_error else ""
                 if failures or last_error:  # healthy periods stay quiet; the viewer prints a heartbeat
                     print(
@@ -372,5 +373,3 @@ class GrpcHead(threading.Thread):
             self.call(head_message(0, 0, self.yaw_field), timeout=self.timeout)
         except Exception:
             pass
-
-
