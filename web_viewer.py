@@ -1700,6 +1700,11 @@ def index():
         .rec-light { display: inline-block; width: 0.8em; height: 0.8em; margin-left: 0.4em; border: 2px solid currentColor; border-radius: 50%; }
         .rec-light.rec-on { background: #ff2d2d; border-color: #ff2d2d; box-shadow: 0 0 8px #ff2d2d; animation: rec-blink 1s steps(1) infinite; }
         @keyframes rec-blink { 50% { background: transparent; box-shadow: none; } }
+        .rec-btn { font-variant-numeric: tabular-nums; }
+        .rec-btn .q-btn__content { flex-wrap: nowrap; white-space: nowrap; }
+        .rec-btn .rec-light { flex: 0 0 auto; margin-left: 0.3em; }
+        .rec-btn.btn-on { background: #2a1111 !important; color: #FFAE00 !important; opacity: 1 !important; border-color: #ff2d2d; }
+        .rec-btn.btn-on .q-btn__content { color: #FFAE00 !important; }
 
         .icon-btn { background: #242424 !important; border: 1px solid #333; transition: background 0.15s, border-color 0.15s, box-shadow 0.15s; }
         .icon-btn:hover { background: #2e2e2e !important; border-color: #FFAE00; }
@@ -1836,7 +1841,7 @@ def index():
                             ui.item_section("DANCE")
                         dance_item.set_visibility(False)  # refresh() shows it once the bridge is up
                     with ui.element("div").classes("col-span-2 flex items-center gap-2 sm:col-span-1 sm:flex-1"):
-                        recording_button = ui.button(text="RECORD", on_click=toggle_recording_from_ui, **action).props("dense outline").classes(action_classes + " amber-btn grow")
+                        recording_button = ui.button(text="RECORD", on_click=toggle_recording_from_ui, **action).props("dense outline").classes(action_classes + " amber-btn rec-btn grow")
                         with recording_button:
                             rec_light = ui.element("span").classes("rec-light" + (" rec-on" if recording_active else ""))
                         ui.button(icon="folder_open", on_click=open_recordings_folder).props("flat round dense color=white").classes("icon-btn").tooltip("Open recordings folder")
