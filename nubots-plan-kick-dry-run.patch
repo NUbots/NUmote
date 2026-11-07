@@ -1,0 +1,63 @@
+diff --git a/module/planning/PlanKick/src/PlanKick.hpp b/module/planning/PlanKick/src/PlanKick.hpp
+--- a/module/planning/PlanKick/src/PlanKick.hpp
++++ b/module/planning/PlanKick/src/PlanKick.hpp
+@@ -42,6 +42,7 @@ namespace module::planning {
+             double ball_angle_threshold    = 0.0;
+             double target_angle_threshold  = 0.0;
+             utility::input::LimbID kick_leg{};
++            bool dry_run = false;
+         } cfg;
+ 
+     public:
+diff --git a/module/planning/PlanKick/src/PlanKick.cpp b/module/planning/PlanKick/src/PlanKick.cpp
+--- a/module/planning/PlanKick/src/PlanKick.cpp
++++ b/module/planning/PlanKick/src/PlanKick.cpp
+@@ -60,5 +60,6 @@ PlanKick::PlanKick(std::unique_ptr<NUClear::Environment> environment) : BehaviourReactor(std::move(environment)) {
+             // Use configuration here from file PlanKick.yaml
+             this->log_level             = config["log_level"].as<NUClear::LogLevel>();
++            cfg.dry_run                 = config["dry_run"].as<bool>();
+             cfg.ball_timeout_threshold  = config["ball_timeout_threshold"].as<double>();
+             cfg.ball_distance_threshold = config["ball_distance_threshold"].as<double>();
+             cfg.ball_angle_threshold    = config["ball_angle_threshold"].as<double>();
+@@ -110,6 +110,17 @@ PlanKick::PlanKick(std::unique_ptr<NUClear::Environment> environment) : BehaviourReactor(std::move(environment)) {
+                 // If the kick leg is forced left, kick left. If the kick leg is auto,
+                 // kick with left leg if ball is more to the left
++                if (cfg.dry_run) {
++                    const bool kick_left = cfg.kick_leg == LimbID::LEFT_LEG
++                                           || (cfg.kick_leg == LimbID::UNKNOWN && rBRr.y() > 0.0);
++                    log<INFO>(fmt::format("DRY RUN: kick conditions passed; leg={}, ball_distance={}m, "
++                                          "ball_angle={}rad, target_angle={}rad",
++                                          kick_left ? "left" : "right",
++                                          ball_distance,
++                                          ball_angle,
++                                          align_angle));
++                    return;
++                }
+                 if (cfg.kick_leg == LimbID::LEFT_LEG || (cfg.kick_leg == LimbID::UNKNOWN && rBRr.y() > 0.0)) {
+                     log<INFO>("LEFT KICK!");
+                     emit<Task>(std::make_unique<Kick>(LimbID::LEFT_LEG));
+                 }
+diff --git a/module/planning/PlanKick/data/config/PlanKick.yaml b/module/planning/PlanKick/data/config/PlanKick.yaml
+--- a/module/planning/PlanKick/data/config/PlanKick.yaml
++++ b/module/planning/PlanKick/data/config/PlanKick.yaml
+@@ -1,4 +1,5 @@
+ # Controls the minimum log level that NUClear log will display
+ log_level: INFO
++dry_run: false
+ 
+ # How long since the last ball measurement before ignoring it and assuming the ball is lost, in milliseconds
+diff --git a/module/planning/PlanKick/README.md b/module/planning/PlanKick/README.md
+--- a/module/planning/PlanKick/README.md
++++ b/module/planning/PlanKick/README.md
+@@ -1,3 +1,11 @@
+ # PlanKick
+ 
++## Dry run
++
++Set `dry_run: true` in `PlanKick.yaml` to run the normal freshness, distance, and alignment checks, log the selected leg and measurements, and return before this planner emits a `Kick` task.
++
++This only suppresses `Kick` tasks emitted by `PlanKick`. Other kick-producing tasks are unaffected, so disable them for an isolated dry-run test.
++
++For a test role, enable `Tester` with only `tasks.kick_to_priority` nonzero. Keep walking and other kick-producing tasks disabled. The role still needs fresh `Ball` and `Sensors` messages for `PlanKick` to evaluate an intent.
++
+ ## Description
