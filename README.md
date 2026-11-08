@@ -42,21 +42,25 @@ Note: use `lsof -i :<NUMOTE_WEB_PORT>` to return the PIDs running on that port t
 
 ![Controller layout](docs/controller_layout.png)
 
-| Input | Action |
-| --- | --- |
-| Left stick | Walk (L3 press is used in the record combo) |
-| Right stick | Turn |
-| D-pad | Head yaw / pitch |
-| A | Random dance |
-| B | Kick |
-| X | Toggle wave |
-| Y | Get up |
-| RB | Toggle chase |
-| Back | Stand |
-| Start | Walk |
-| LT + A | Random soccer celebration |
-| RT + A | Danger dance |
-| RT + B | Power kick |
-| LT, then RT, then L3 | Start / stop recording |
+<div align="center">
+
+|  | Input | Action |
+| :--- | :---: | :--- |
+| **Movement** | <kbd>Left stick</kbd> | Walk |
+|  | <kbd>Right stick</kbd> | Turn |
+|  | <kbd>D-pad</kbd> | Head yaw / pitch |
+| **Actions** | <kbd>A</kbd> | Random dance |
+|  | <kbd>B</kbd> | Kick |
+|  | <kbd>X</kbd> | Toggle wave |
+|  | <kbd>Y</kbd> | Get up |
+| **Modes** | <kbd>RB</kbd> | Toggle chase |
+|  | <kbd>Back</kbd> | Stand |
+|  | <kbd>Start</kbd> | Walk |
+| **Combos** | <kbd>LT</kbd> + <kbd>A</kbd> | Random soccer celebration |
+|  | <kbd>RT</kbd> + <kbd>A</kbd> | Danger dance |
+|  | <kbd>RT</kbd> + <kbd>B</kbd> | Power kick |
+|  | <kbd>LT</kbd>, <kbd>RT</kbd>, then <kbd>L3</kbd> | Start / stop recording |
+
+</div>
 
 Nintendo Switch controllers have the same actions: ZL/ZR/L/R are LT/RT/LB/RB, Minus/Plus are Back/Start, and face buttons follow the printed label, so A/B and X/Y sit in swapped positions.
