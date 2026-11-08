@@ -51,8 +51,3 @@ Note: use `lsof -i :<NUMOTE_WEB_PORT>` to return the PIDs running on that port t
 | LT, then RT, then L3 | Start / stop recording |
 
 Nintendo Switch controllers have the same actions: ZL/ZR/L/R are LT/RT/LB/RB, Minus/Plus are Back/Start, and face buttons follow the printed label, so A/B and X/Y sit in swapped positions.
-
-## Kick
-
-- **B:** soccer kick. It releases itself after 5 seconds, or press any kick button again.
-- **RT + B:** power kick. follows the same latch mechanism as the regular kick.
