@@ -20,6 +20,8 @@ A browser remote for Booster K1 robots: live cameras, driving from on-screen sti
 
 Set `NUMOTE_WEB_PORT` to change the port. 
 
+Note: use `lsof -i :<NUMOTE_WEB_PORT>` to return the PIDs running on that port then use `kill -9 <PID>` to terminate zombie processes.
+
 ( RECOMMENDED ) `scripts/numote.sh --install-launcher` adds an applications menu entry.
 
 <p align="center">
@@ -27,7 +29,7 @@ Set `NUMOTE_WEB_PORT` to change the port.
 </p>
 
 
-Note: use `lsof -i :<NUMOTE_WEB_PORT>` to return the PIDs running on that port then use `kill -9 <PID>` to terminate zombie processes.
+
 
 ## Using the viewer
 
