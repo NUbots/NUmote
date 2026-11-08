@@ -22,7 +22,10 @@ Set `NUMOTE_WEB_PORT` to change the port.
 
 ( RECOMMENDED ) `scripts/numote.sh --install-launcher` adds an applications menu entry.
 
-![NUmote launcher](docs/launcher.png)
+<p align="center">
+  <img src="docs/launcher.png" alt="NUmote launcher" width="600">
+</p>
+
 
 Note: use `lsof -i :<NUMOTE_WEB_PORT>` to return the PIDs running on that port then use `kill -9 <PID>` to terminate zombie processes.
 
