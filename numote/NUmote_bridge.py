@@ -51,15 +51,15 @@ SDK_ROBOT_NAME = os.environ.get("NUMOTE_BOOSTER_SDK_ROBOT_NAME", "")
 K1_DANCE_CHOICES = (
 	("Arabic Dance", "kArbicDance"),
 	("Michael Dance 1", "kMichaelDance1"),
+	("Michael Dance 2", "kMichaelDance2"),
+	("Michael Dance 3", "kMichaelDance3"),
+	("Shan He Gu Ren Dance", "kShanHeGuRenDance"),
 	("Gai Ge Chun Feng Dance", "kGaiGeChunFengDance"),
+	("Michael Dance 1 + 2", "kMichaelDance1And2"),
 )
 K1_DANGEROUS_DANCE_CHOICES = (  # big whole-body moves; only reachable through their own command
 	("Boxing Style Kick", "kBoxingStyleKick"),
-	("Michael Dance 1 + 2", "kMichaelDance1And2"),
-	("Michael Dance 2", "kMichaelDance2"),
-	("Michael Dance 3", "kMichaelDance3"),
 	("Roundhouse Kick", "kRoundhouseKick"),
-	("Shan He Gu Ren Dance", "kShanHeGuRenDance"),
 )
 DANCE_COMMANDS = {"dance": K1_DANCE_CHOICES, "dangerous_dance": K1_DANGEROUS_DANCE_CHOICES}
 
