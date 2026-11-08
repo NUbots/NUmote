@@ -51,12 +51,17 @@ SDK_ROBOT_NAME = os.environ.get("NUMOTE_BOOSTER_SDK_ROBOT_NAME", "")
 K1_DANCE_CHOICES = (
 	("Arabic Dance", "kArbicDance"),
 	("Michael Dance 1", "kMichaelDance1"),
+	("Gai Ge Chun Feng Dance", "kGaiGeChunFengDance"),
+)
+K1_DANGEROUS_DANCE_CHOICES = (  # big whole-body moves; only reachable through their own command
+	("Boxing Style Kick", "kBoxingStyleKick"),
+	("Michael Dance 1 + 2", "kMichaelDance1And2"),
 	("Michael Dance 2", "kMichaelDance2"),
 	("Michael Dance 3", "kMichaelDance3"),
+	("Roundhouse Kick", "kRoundhouseKick"),
 	("Shan He Gu Ren Dance", "kShanHeGuRenDance"),
-	("Gai Ge Chun Feng Dance", "kGaiGeChunFengDance"),
-	("Michael Dance 1 + 2", "kMichaelDance1And2"),
 )
+DANCE_COMMANDS = {"dance": K1_DANCE_CHOICES, "dangerous_dance": K1_DANGEROUS_DANCE_CHOICES}
 
 latest = [None] * (DETECTIONS_STREAM + 1)  # (sequence, packet) per stream
 seq = 0
@@ -161,7 +166,7 @@ def authorize_strong_kick(request):
 	if not STRONG_KICK_TOKEN:
 		return False, "robot-action relay is not configured"
 	command = request.get("command")
-	if command not in ("shoot", "dance"):
+	if command != "shoot" and command not in DANCE_COMMANDS:
 		return False, "unsupported command"
 
 	timestamp = request.get("timestamp")
@@ -213,8 +218,9 @@ def execute_strong_kick():
 			raise RuntimeError(f"Booster SDK rejected kShoot (status {status})")
 
 
-def execute_random_dance():
-	dance_name, dance_enum_name = random.choice(K1_DANCE_CHOICES)
+def execute_random_dance(choices):
+	dance_name, dance_enum_name = random.choice(choices)
+	print(f"dance selected: {dance_name} ({dance_enum_name})", flush=True)
 	with sdk_lock:
 		sdk, client = get_sdk_client()
 		dance_id = int(getattr(sdk.WholeBodyDanceId, dance_enum_name))
@@ -244,7 +250,7 @@ def serve_command_client(conn, addr):
 				execute_strong_kick()
 				response = {"success": True}
 			else:
-				dance_name = execute_random_dance()
+				dance_name = execute_random_dance(DANCE_COMMANDS[command])
 				response = {"success": True, "dance": dance_name}
 			print(f"{command} accepted from {addr[0]}", flush=True)
 		except Exception as e:
