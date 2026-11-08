@@ -13,7 +13,9 @@ import hashlib, hmac, html, json, posixpath, random, secrets, shlex, socket
 import cv2
 import numpy as np
 
-SETTINGS_PATH = Path(__file__).with_name(".numote_settings.json")
+ROOT = Path(__file__).resolve().parent.parent
+ASSETS = ROOT / "assets"
+SETTINGS_PATH = ROOT / ".numote_settings.json"
 
 def load_settings():
     try:
@@ -320,7 +322,7 @@ def stop_recorders(recorders):
     return saved, errors
 
 def recordings_dir():
-    return Path(os.environ.get("NUMOTE_RECORDING_DIR", Path(__file__).resolve().parent / "recordings"))
+    return Path(os.environ.get("NUMOTE_RECORDING_DIR", ROOT / "recordings"))
 
 def open_recordings_folder():
     """Opens the folder on the machine running this script."""
@@ -1607,7 +1609,7 @@ def index():
             if jpeg:
                 img.set_source("data:image/jpeg;base64," + base64.b64encode(jpeg).decode())
             else:
-                img.set_source("no_video.jpg")
+                img.set_source(ASSETS / "no_video.jpg")
 
         det_key = (view["mode"] == "DETECTIONS", state["detections_count"])
         if det_key != last.get("det"):
@@ -1821,7 +1823,7 @@ def index():
         with ui.element("div").classes("panel header"):
             # phone: the status chip drops to its own line. desktop: one row, chip fills the middle.
             with ui.row().classes("xl:contents w-full items-center gap-x-2 gap-y-1 sm:gap-x-4"):
-                ui.image(source="numote.png").props("fit=contain").classes("shrink-0 w-12 h-7 sm:w-20 sm:h-12")  # 517x302 logo
+                ui.image(source=ASSETS / "numote.png").props("fit=contain").classes("shrink-0 w-12 h-7 sm:w-20 sm:h-12")  # 517x302 logo
 
                 ip_menu()
                 robot_button = ui.button().props(f"flat round dense {robot_icon_props()}").classes("icon-btn" + (" icon-on" if robot_ip else ""))
@@ -1953,4 +1955,4 @@ def index():
 
     ui.timer(1 / 30, refresh)
 
-ui.run(port=int(os.environ.get("NUMOTE_WEB_PORT", "8080")), dark=True, title="NUmote", favicon="fav.png")
+ui.run(port=int(os.environ.get("NUMOTE_WEB_PORT", "8080")), dark=True, title="NUmote", favicon=ASSETS / "fav.png")

@@ -2,7 +2,7 @@
 
 A browser remote for Booster K1 robots: live cameras, driving from on-screen sticks or a gamepad, robot actions and video recording.
 
-![NUmote viewer](viewer_screenshot.png)
+![NUmote viewer](docs/viewer_screenshot.png)
 
 ## Requirements
 
@@ -12,13 +12,15 @@ A browser remote for Booster K1 robots: live cameras, driving from on-screen sti
 
 ## Install
 
-`python3 -m pip install -r requirements.txt`
+`scripts/numote.sh` creates `.venv` and installs `requirements.txt` on first run, and again when they change.
 
 ## Run
 
-`python3 web_viewer.py`, then open http://localhost:8080
+`scripts/numote.sh` (picks a free port if 8080 is taken), then open http://localhost:8080
 
-Set `NUMOTE_WEB_PORT` to change the port.
+Set `NUMOTE_WEB_PORT` to change the port. `scripts/numote.sh --install-launcher` adds an applications menu entry.
+
+Note: use `lsof -i :<NUMOTE_WEB_PORT>` to return the PIDs running on that port then use `kill -9 <PID>` to terminate zombie processes.
 
 ## Using the viewer
 
@@ -29,9 +31,28 @@ Set `NUMOTE_WEB_PORT` to change the port.
 
 ## Controller layout
 
-![Controller layout](controller_layout.png)
+![Controller layout](docs/controller_layout.png)
+
+| Input | Action |
+| --- | --- |
+| Left stick | Walk (L3 press is used in the record combo) |
+| Right stick | Turn |
+| D-pad | Head yaw / pitch |
+| A | Random dance |
+| B | Kick |
+| X | Toggle wave |
+| Y | Get up |
+| RB | Toggle chase |
+| Back | Stand |
+| Start | Walk |
+| LT + A | Random soccer celebration |
+| RT + A | Danger dance |
+| RT + B | Power kick |
+| LT, then RT, then L3 | Start / stop recording |
+
+Nintendo Switch controllers have the same actions: ZL/ZR/L/R are LT/RT/LB/RB, Minus/Plus are Back/Start, and face buttons follow the printed label, so A/B and X/Y sit in swapped positions.
 
 ## Kick
 
-- **B:** soccer kick. It releases itself after 5 seconds, or press B again.
-- **RT + B:** powerful shot. The robot currently rejects it until Booster enables it.
+- **B:** soccer kick. It releases itself after 5 seconds, or press any kick button again.
+- **RT + B:** power kick. follows the same latch mechanism as the regular kick.
