@@ -9,7 +9,7 @@ import pygame._sdl2.controller as sdl_controller
 from nicegui import app, ui
 from grpc_control import GrpcHead, Sender
 from robot import extract_jpeg, map_stick, map_yaw, parse
-import hashlib, hmac, html, json, posixpath, secrets, shlex, socket
+import hashlib, hmac, html, json, posixpath, random, secrets, shlex, socket
 import cv2
 import numpy as np
 
@@ -39,6 +39,15 @@ KICK_ACTION = os.environ.get("NUMOTE_KICK_ACTION", "kick")
 DEFAULT_AGENT_ID = "com.boosterobotics.default"
 SOCCER_AGENT_ID = "com.boosterobotics.soccer"
 SOCCER_KICK_ACTION = os.environ.get("NUMOTE_SOCCER_KICK_ACTION_ID", "visual_kick_ball")
+SOCCER_POWER_KICK_ACTION = os.environ.get("NUMOTE_SOCCER_POWER_KICK_ACTION_ID", "visual_kick_ball_power")
+SOCCER_CELEBRATIONS = (  # component ids from the soccer agent's shortcut_list.json
+    ("Waka Waka", "robocup_wakawaka"),
+    ("Siuuu", "robocup_siuuu"),
+    ("Ring Kiss", "robocup_ring_kiss"),
+    ("Arms Crossed", "robocup_arms_crossed"),
+    ("Point to Sky", "robocup_point_to_sky"),
+    ("Cradle Dance", "robocup_cradle"),
+)
 KICK_LATCH_SECONDS = 8  # the soccer kick stays latched on until it's switched off, so it's released after this long
 STRONG_KICK_PORT = int(os.environ.get("NUMOTE_STRONG_KICK_PORT", "51121"))
 # shared with the bridge each time this app starts it, so the strong kick and dance work without any setup;
@@ -652,10 +661,10 @@ def mapping_html():
         <circle class='ctl on' cx='355' cy='170' r='6'/><circle class='ctl on' cx='405' cy='170' r='6'/>
         {face_buttons}
       </g>
-      {callout(245, 92, "left", 57, labels['lt'], f"Recording combo|({labels['lt']} + {labels['rt']} + L3)")}
+      {callout(245, 92, "left", 57, labels['lt'], f"Celebration (+A)|Recording combo|({labels['lt']} + {labels['rt']} + L3)")}
       {callout(248, 175, "left", 165, 'Left stick', 'Walk (press: L3)')}
       {callout(300, 222, "left", 226, 'D-pad', 'Head yaw / pitch')}
-      {callout(515, 92, "right", 57, labels['rt'], 'Strong kick|(hold + B)')}
+      {callout(515, 92, "right", 57, labels['rt'], 'Power kick (+B)|Danger dance (+A)')}
       {callout(515, 112, "right", 130, labels['rb'], desc['RB'])}
       <polyline class='leader' points='640,165 678,240 712,240'/><circle class='dot' cx='640' cy='165' r='3'/>
       <polyline class='leader' points='716,194 712,194 712,286 716,286'/>
@@ -767,7 +776,13 @@ def poll_pad():
     for i in newly_pressed:
         name, action = actions.get(i, (None, None))
         if controller and i == pygame.CONTROLLER_BUTTON_B and right_trigger:
-            name, action = "B+RT", send_strong_kick
+            name, action = "B+RT", send_soccer_power_kick
+        elif controller and i == pygame.CONTROLLER_BUTTON_A and left_trigger and right_trigger:
+            name, action = "A+LT+RT", None  # ambiguous, so neither dance fires
+        elif controller and i == pygame.CONTROLLER_BUTTON_A and right_trigger:
+            name, action = "A+RT", send_dangerous_dance
+        elif controller and i == pygame.CONTROLLER_BUTTON_A and left_trigger:
+            name, action = "A+LT", send_soccer_celebration
         print(f"button {i} pressed" + (f" ({name})" if name else ""))
         if recording_combo and i == pygame.CONTROLLER_BUTTON_LEFTSTICK:
             asyncio.create_task(asyncio.to_thread(toggle_video_recording))
@@ -914,7 +929,7 @@ def send_action(action: str, value: int = 0, agent: str = "com.boosterobotics.de
     return _send_robot_request(msg, f"action {action} agent={agent}")
 
 def send_relay_command(command):
-    label = "Strong Kick" if command == "shoot" else "Random Dance"
+    label = {"shoot": "Strong Kick", "dance": "Random Dance", "dangerous_dance": "Dangerous Dance"}[command]
     if not robot_ip:
         print(f"{label} failed: no robot selected")
         return None
@@ -1212,13 +1227,16 @@ def start_bridged_mode_for_connection(ip):
             start_bridged_mode(ip)
 
 
-def send_random_dance():
-    response = send_relay_command("dance")
+def send_random_dance(command="dance"):
+    response = send_relay_command(command)
     if not response:
         return None
     dance_name = response.get("dance", "random dance")
-    print(f"Random dance accepted: {dance_name}")
+    print(f"{command} accepted: {dance_name}")
     return dance_name
+
+def send_dangerous_dance():
+    return send_random_dance("dangerous_dance")
 
 
 async def random_dance_from_ui():
@@ -1257,10 +1275,11 @@ def ensure_agent(agent):
 
 kick_lock = threading.RLock()
 kick_timer = None
+kick_latched = None  # (label, component id) of the kick currently latched on
 
 def stop_soccer_kick():
     """Release the kick latch; if the robot won't take that, leave the soccer agent instead."""
-    global kick_timer
+    global kick_timer, kick_latched
     with kick_lock:
         if kick_timer:
             kick_timer.cancel()
@@ -1268,15 +1287,17 @@ def stop_soccer_kick():
         if not state["kicking"]:
             return True
         state["kicking"] = False
+        label, action_id = kick_latched
+        kick_latched = None
         try:
-            released = send_action(SOCCER_KICK_ACTION, 1, SOCCER_AGENT_ID)
+            released = send_action(action_id, 1, SOCCER_AGENT_ID)
         except Exception as e:
-            print(f"Soccer Kick Ball release failed: {e}")
+            print(f"{label} release failed: {e}")
             released = False
         if released:
-            print("Soccer Kick Ball released")
+            print(f"{label} released")
             return True
-        print("Soccer Kick Ball release rejected; leaving the soccer agent")
+        print(f"{label} release rejected; leaving the soccer agent")
         try:
             start_agent(DEFAULT_AGENT_ID)
             state.update(chasing=False)
@@ -1284,27 +1305,47 @@ def stop_soccer_kick():
             print(f"Couldn't leave the soccer agent: {e}")
         return False
 
-def send_soccer_kick():
-    """Latch the soccer kick on (starting the soccer agent if needed; chasing is left alone). Pressing again releases it."""
-    global kick_timer
+def latch_soccer_kick(label, action_id):
+    """Latch a soccer kick on (starting the soccer agent if needed; chasing is left alone). Pressing any kick again releases it."""
+    global kick_timer, kick_latched
     with kick_lock:
         if state["kicking"]:
             return stop_soccer_kick()
         try:
-            succeeded = ensure_agent(SOCCER_AGENT_ID) and send_action(SOCCER_KICK_ACTION, 0, SOCCER_AGENT_ID)
+            succeeded = ensure_agent(SOCCER_AGENT_ID) and send_action(action_id, 0, SOCCER_AGENT_ID)
         except Exception as e:
-            print(f"Soccer Kick Ball request failed: {e}")
+            print(f"{label} request failed: {e}")
             succeeded = False
 
         if not succeeded:
             return False
 
         state["kicking"] = True
+        kick_latched = (label, action_id)
         kick_timer = threading.Timer(KICK_LATCH_SECONDS, stop_soccer_kick)
         kick_timer.daemon = True
         kick_timer.start()
-        print(f"Soccer Kick Ball accepted; releasing in {KICK_LATCH_SECONDS}s")
+        print(f"{label} accepted; releasing in {KICK_LATCH_SECONDS}s")
         return True
+
+def send_soccer_kick():
+    return latch_soccer_kick("Soccer Kick Ball", SOCCER_KICK_ACTION)
+
+def send_soccer_power_kick():
+    return latch_soccer_kick("Soccer Power Kick", SOCCER_POWER_KICK_ACTION)
+
+def send_soccer_celebration():
+    """A random soccer-agent celebration (a single click, starting the soccer agent if needed)."""
+    label, action_id = random.choice(SOCCER_CELEBRATIONS)
+    print(f"soccer celebration selected: {label} ({action_id})")
+    try:
+        succeeded = ensure_agent(SOCCER_AGENT_ID) and send_action(action_id, 0, SOCCER_AGENT_ID)
+    except Exception as e:
+        print(f"{label} request failed: {e}")
+        return False
+    if succeeded:
+        print(f"{label} accepted")
+    return succeeded
 
 def send_robot_mode(mode: int):
     """Switch between STAND and WALK through the robot's app control endpoint."""
