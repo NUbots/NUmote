@@ -18,7 +18,9 @@ A browser remote for Booster K1 robots: live cameras, driving from on-screen sti
 
 `scripts/numote.sh` (picks a free port if 8080 is taken), then open http://localhost:8080
 
-Set `NUMOTE_WEB_PORT` to change the port. `scripts/numote.sh --install-launcher` adds an applications menu entry.
+Set `NUMOTE_WEB_PORT` to change the port. 
+
+( RECOMMENDED ) `scripts/numote.sh --install-launcher` adds an applications menu entry.
 
 Note: use `lsof -i :<NUMOTE_WEB_PORT>` to return the PIDs running on that port then use `kill -9 <PID>` to terminate zombie processes.
 
