@@ -51,6 +51,7 @@ SOCCER_CELEBRATIONS = (  # component ids from the soccer agent's shortcut_list.j
     ("Cradle Dance", "robocup_cradle"),
 )
 KICK_LATCH_SECONDS = 8  # the soccer kick stays latched on until it's switched off, so it's released after this long
+CRITICAL_BATTERY = 15  # nularm
 STRONG_KICK_PORT = int(os.environ.get("NUMOTE_STRONG_KICK_PORT", "51121"))
 # shared with the bridge each time this app starts it, so the strong kick and dance work without any setup;
 # set NUMOTE_STRONG_KICK_TOKEN to pin one instead
@@ -1688,6 +1689,12 @@ def index():
                 battery_display.style('color: #c91c1c')
             battery_display.classes(add="battery-low") if b is not None and b < 30 else battery_display.classes(remove="battery-low")
 
+        # beep in the browser while the battery is critically low
+        critical = b is not None and b < CRITICAL_BATTERY
+        if critical != last.get("critical"):
+            last["critical"] = critical
+            ui.run_javascript(f"setLowBatteryAlarm({'true' if critical else 'false'})")
+
     async def refresh_bridge():
         if not robot_ip:
             notify("No robot selected", type="warning")
@@ -1941,6 +1948,34 @@ def index():
             const m = Math.hypot(x, y);
             const k = m > 1 ? 1 / m : 1;
             knob.style.transform = `translate(${x * k * 100}px, ${y * k * 100}px)`;
+        };
+
+        // low battery alarm: three short beeps every 10 s while enabled.
+        // browsers keep audio muted until the user interacts, so unlock it on the first click / key press
+        window.audioCtx = window.audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+        const unlockAudio = () => window.audioCtx.state === "suspended" && window.audioCtx.resume();
+        ["pointerdown", "keydown", "touchstart"].forEach(e => document.addEventListener(e, unlockAudio));
+        const beep = (start) => {
+            const ctx = window.audioCtx, osc = ctx.createOscillator(), gain = ctx.createGain();
+            osc.type = "square";
+            osc.frequency.value = 1760;
+            gain.gain.setValueAtTime(0.0001, start);
+            gain.gain.exponentialRampToValueAtTime(0.2, start + 0.01);
+            gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.15);
+            osc.connect(gain).connect(ctx.destination);
+            osc.start(start);
+            osc.stop(start + 0.16);
+        };
+        const beepBurst = () => {
+            const t = window.audioCtx.currentTime;
+            [0, 0.25, 0.5].forEach(d => beep(t + d));
+        };
+        window.setLowBatteryAlarm = (on) => {
+            clearInterval(window.lowBatteryTimer);
+            window.lowBatteryTimer = null;
+            if (!on) return;
+            beepBurst();
+            window.lowBatteryTimer = setInterval(beepBurst, 10000);
         };
     """)
 
