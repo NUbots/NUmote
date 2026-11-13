@@ -3,3 +3,4 @@ __pycache__/
 recordings/*
 .venv/
 .numote_settings.json
+/certs
